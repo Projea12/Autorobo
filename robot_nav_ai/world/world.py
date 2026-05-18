@@ -486,67 +486,201 @@ class World:
 
     def _build_random_obstacles(self) -> None:
         """
-        Scatter a mix of boxes and cylinders inside the arena.
-        Keeps a clear zone of radius 0.8 m around the origin so the
-        robot always has room to spawn.
-        """
-        half    = self._cfg.arena_size / 2.0
-        margin  = 0.4          # stay this far from walls
-        clear_r = 0.8          # clear zone around origin
+        Place 5–10 obstacles of mixed shape, size, and dynamics.
 
-        shapes = ["box", "cylinder"]
-        placed = 0
+        Algorithm
+        ---------
+        1. Pick a random count in [min_obstacles, max_obstacles].
+        2. For each obstacle, sample a candidate (x, y) and reject if:
+             a. Inside the robot spawn clear-zone  (r < 0.8 m from origin)
+             b. Closer than `sep` metres to any already-placed obstacle
+             c. Within `margin` metres of a wall
+           Up to 500 attempts; placed count may be less than target if the
+           arena is too crowded.
+        3. Randomly assign "box" or "cylinder".
+        4. Randomly mark `dynamic_ratio` fraction of obstacles as dynamic;
+           give them a random initial velocity so they move from the start.
+
+        Size ranges
+        -----------
+        Box      : L  0.15–0.50 m,  W  0.15–0.50 m,  H  0.20–0.60 m
+        Cylinder : r  0.08–0.20 m,  H  0.20–0.60 m
+
+        Colours
+        -------
+        Static box      → orange-brown
+        Static cylinder → green
+        Dynamic box     → red-orange  (signals moving hazard)
+        Dynamic cylinder→ magenta
+        """
+        target   = self._rng.randint(self._cfg.min_obstacles,
+                                     self._cfg.max_obstacles)
+        half     = self._cfg.arena_size / 2.0
+        margin   = 0.45    # keep this far from each wall
+        clear_r  = 0.80    # robot spawn safe zone (centred at origin)
+        sep      = 0.35    # minimum distance between obstacle footprints
+
+        # footprints of already-placed obstacles: list of (x, y, footprint_r)
+        footprints: List[Tuple[float, float, float]] = []
+
+        placed   = 0
         attempts = 0
 
-        while placed < self._cfg.num_obstacles and attempts < 500:
+        while placed < target and attempts < 600:
             attempts += 1
+
             x = self._rng.uniform(-half + margin, half - margin)
             y = self._rng.uniform(-half + margin, half - margin)
 
+            # ── reject: inside robot spawn zone ──────────────────────────────
             if math.hypot(x, y) < clear_r:
                 continue
 
-            shape = self._rng.choice(shapes)
-
+            # ── reject: too close to an existing obstacle ─────────────────────
+            shape = self._rng.choice(["box", "cylinder"])
             if shape == "box":
-                lx = self._rng.uniform(0.15, 0.50)
-                ly = self._rng.uniform(0.15, 0.50)
-                lz = self._rng.uniform(0.20, 0.60)
+                lx  = self._rng.uniform(0.15, 0.50)
+                ly  = self._rng.uniform(0.15, 0.50)
+                lz  = self._rng.uniform(0.20, 0.60)
                 yaw = self._rng.uniform(0, math.pi)
-                obs = ObstacleConfig("box", (x, y, lz / 2), (lx, ly, lz), yaw)
+                footprint_r = math.hypot(lx, ly) / 2 + sep
             else:
-                r  = self._rng.uniform(0.08, 0.20)
-                lz = self._rng.uniform(0.20, 0.60)
-                obs = ObstacleConfig("cylinder", (x, y, lz / 2), (r, lz), 0.0)
+                r   = self._rng.uniform(0.08, 0.20)
+                lz  = self._rng.uniform(0.20, 0.60)
+                yaw = 0.0
+                footprint_r = r + sep
+
+            too_close = any(
+                math.hypot(x - fx, y - fy) < footprint_r + fr
+                for fx, fy, fr in footprints
+            )
+            if too_close:
+                continue
+
+            # ── decide static vs dynamic ──────────────────────────────────────
+            is_dynamic = self._rng.random() < self._cfg.dynamic_ratio
+            mass       = 1.0 if is_dynamic else 0.0
+
+            speed = self._rng.uniform(self._cfg.dynamic_speed_min,
+                                      self._cfg.dynamic_speed_max)
+            angle = self._rng.uniform(0, 2 * math.pi)
+            vel   = (speed * math.cos(angle), speed * math.sin(angle)) if is_dynamic \
+                    else (0.0, 0.0)
+
+            # ── build ObstacleConfig ──────────────────────────────────────────
+            if shape == "box":
+                obs = ObstacleConfig(
+                    shape="box",
+                    position=(x, y, lz / 2),
+                    size=(lx, ly, lz),
+                    yaw=yaw,
+                    mass=mass,
+                    dynamic=is_dynamic,
+                    velocity=vel,
+                )
+            else:
+                obs = ObstacleConfig(
+                    shape="cylinder",
+                    position=(x, y, lz / 2),
+                    size=(r, lz),
+                    yaw=0.0,
+                    mass=mass,
+                    dynamic=is_dynamic,
+                    velocity=vel,
+                )
 
             self._place_obstacle(obs)
+            footprints.append((x, y, footprint_r - sep))
             placed += 1
 
-    def _place_obstacle(self, obs: ObstacleConfig) -> None:
-        orn = p.getQuaternionFromEuler([0, 0, obs.yaw])
+    # ── colours per obstacle category ────────────────────────────────────────
+    _COLOUR_MAP = {
+        ("box",      False): [0.70, 0.40, 0.10, 1.0],   # orange-brown static box
+        ("cylinder", False): [0.20, 0.55, 0.20, 1.0],   # green static cylinder
+        ("box",      True):  [0.85, 0.20, 0.10, 1.0],   # red dynamic box
+        ("cylinder", True):  [0.75, 0.10, 0.75, 1.0],   # magenta dynamic cylinder
+    }
 
+    def _place_obstacle(self, obs: ObstacleConfig) -> None:
+        """
+        Spawn one obstacle with explicit p.createCollisionShape /
+        p.createVisualShape / p.createMultiBody calls.
+
+        Static  (mass=0) → immovable; only walls and the floor can stop the robot.
+        Dynamic (mass>0) → full rigid-body physics; bounces off walls and other
+                           obstacles; initial velocity set via resetBaseVelocity.
+        """
+        colour  = obs.colour or self._COLOUR_MAP.get(
+            (obs.shape, obs.dynamic), _BOX_COLOUR
+        )
+        orn     = p.getQuaternionFromEuler([0, 0, obs.yaw])
+
+        # ── 1. collision shape ────────────────────────────────────────────────
         if obs.shape == "box":
             lx, ly, lz = obs.size
-            body_id = self._make_box(
-                half_extents=(lx / 2, ly / 2, lz / 2),
-                position=obs.position,
-                orientation=orn,
-                colour=_BOX_COLOUR,
-                mass=0,
+            col_id = p.createCollisionShape(
+                p.GEOM_BOX,
+                halfExtents=[lx / 2, ly / 2, lz / 2],
+                physicsClientId=self._client,
+            )
+            vis_id = p.createVisualShape(
+                p.GEOM_BOX,
+                halfExtents=[lx / 2, ly / 2, lz / 2],
+                rgbaColor=colour,
+                physicsClientId=self._client,
             )
         elif obs.shape == "cylinder":
             radius, height = obs.size
-            body_id = self._make_cylinder(
+            col_id = p.createCollisionShape(
+                p.GEOM_CYLINDER,
                 radius=radius,
                 height=height,
-                position=obs.position,
-                colour=_CYLINDER_COLOUR,
-                mass=0,
+                physicsClientId=self._client,
+            )
+            vis_id = p.createVisualShape(
+                p.GEOM_CYLINDER,
+                radius=radius,
+                length=height,
+                rgbaColor=colour,
+                physicsClientId=self._client,
             )
         else:
             raise ValueError(f"Unknown obstacle shape: {obs.shape!r}")
 
-        self._obstacle_ids.append(body_id)
+        # ── 2. rigid body ─────────────────────────────────────────────────────
+        body_id = p.createMultiBody(
+            baseMass=obs.mass,
+            baseCollisionShapeIndex=col_id,
+            baseVisualShapeIndex=vis_id,
+            basePosition=list(obs.position),
+            baseOrientation=list(orn),
+            physicsClientId=self._client,
+        )
+
+        # ── 3. physics material properties ───────────────────────────────────
+        p.changeDynamics(
+            body_id, -1,
+            lateralFriction=0.5,
+            restitution=0.8,          # bouncy — dynamic obstacles bounce off walls
+            linearDamping=0.05,       # light air drag to prevent infinite drift
+            angularDamping=0.1,
+            physicsClientId=self._client,
+        )
+
+        # ── 4. initial velocity (dynamic only) ────────────────────────────────
+        if obs.dynamic and (obs.velocity[0] != 0 or obs.velocity[1] != 0):
+            p.resetBaseVelocity(
+                body_id,
+                linearVelocity=[obs.velocity[0], obs.velocity[1], 0],
+                angularVelocity=[0, 0, 0],
+                physicsClientId=self._client,
+            )
+
+        # ── 5. register ───────────────────────────────────────────────────────
+        if obs.dynamic:
+            self._dynamic_ids.append(body_id)
+        else:
+            self._static_ids.append(body_id)
 
     def _place_goal_marker(self, x: float, y: float, z: float = 0.01) -> None:
         if self._goal_id is not None:
