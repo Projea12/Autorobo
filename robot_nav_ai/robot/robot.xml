@@ -1,0 +1,368 @@
+<mujoco model="autorobo_v1">
+  <!--
+    AutoRobo v1 — Mobile Manipulation Robot
+    =========================================
+    Architecture : Differential-drive base + 6-DOF arm (UR5 proportions) + parallel gripper
+    Coordinate   : +X forward, +Y left, +Z up  (standard right-hand)
+    Units        : metres · radians · kg · Newton · Newton·metre
+
+    Degrees of freedom
+      freejoint  (base)         : 7 qpos / 6 qvel
+      wheel_left_joint          : 1 / 1
+      wheel_right_joint         : 1 / 1
+      joint1 … joint6 (arm)     : 6 / 6
+      finger_left_joint         : 1 / 1
+      finger_right_joint        : 1 / 1
+      ─────────────────────────────────────
+      TOTAL                     : 17 qpos / 16 qvel
+
+    Actuators (nu = 9)
+      drive_left / drive_right  : velocity control (differential drive)
+      arm_j1 … arm_j6           : position control (kp decreases toward tip)
+      gripper                   : position control (left finger; right coupled by equality)
+
+    Sensor data (22 sensor objects, 48 float outputs)
+      imu_gyro(3)  imu_accel(3)  imu_quat(4)
+      base_linvel(3)  base_angvel(3)
+      q1…q6(6)  dq1…dq6(6)
+      wrist_force(3)  wrist_torque(3)
+      finger_l(1)  finger_r(1)
+      touch_left(1)  touch_right(1)
+      ee_pos(3)  ee_quat(4)  ee_linvel(3)
+  -->
+
+  <!-- ── compiler ───────────────────────────────────────────────────────── -->
+  <compiler angle="radian" autolimits="true"/>
+
+  <!-- ── physics options ───────────────────────────────────────────────── -->
+  <option timestep="0.002" gravity="0 0 -9.81" integrator="RK4"/>
+
+  <!-- ── defaults (reduces repetition, easier to tune per class) ───────── -->
+  <default>
+    <default class="chassis">
+      <geom condim="3" friction="0.8 0.1 0.1" rgba="0.18 0.20 0.22 1"/>
+    </default>
+    <default class="wheel">
+      <joint damping="0.5" armature="0.001" frictionloss="0.05"/>
+      <geom condim="6" friction="1.5 0.05 0.10" rgba="0.10 0.10 0.10 1"/>
+    </default>
+    <default class="arm">
+      <joint damping="2.0" armature="0.04" frictionloss="0.2"/>
+      <geom condim="3" friction="0.5 0.1 0.1" rgba="0.80 0.40 0.05 1"/>
+    </default>
+    <default class="wrist">
+      <joint damping="0.8" armature="0.008" frictionloss="0.05"/>
+      <geom condim="3" friction="0.5 0.1 0.1" rgba="0.85 0.45 0.05 1"/>
+    </default>
+    <default class="gripper">
+      <joint damping="5.0" armature="0.001" frictionloss="0.1"/>
+      <geom condim="4" friction="2.0 0.5 0.5" rgba="0.60 0.60 0.60 1"/>
+    </default>
+  </default>
+
+  <!-- ── assets ────────────────────────────────────────────────────────── -->
+  <asset>
+    <texture name="grid_tex" type="2d" builtin="checker" width="512" height="512"
+             rgb1="0.15 0.15 0.15" rgb2="0.25 0.25 0.25"/>
+    <material name="floor_mat" texture="grid_tex" texrepeat="8 8" reflectance="0.05"/>
+  </asset>
+
+  <!-- ══════════════════════════════════════════════════════════════════════
+       WORLD BODY
+       ══════════════════════════════════════════════════════════════════════ -->
+  <worldbody>
+
+    <!-- Lighting -->
+    <light name="sun"  pos="0 0 5" dir="0 0 -1" diffuse="0.8 0.8 0.8" castshadow="true"/>
+    <light name="fill" pos="4 4 3" dir="-1 -1 -1" diffuse="0.3 0.3 0.3" castshadow="false"/>
+
+    <!-- Floor (only present for standalone testing; world builder provides its own) -->
+    <geom name="floor" type="plane" size="6 6 0.1" material="floor_mat" condim="3"/>
+
+    <!-- ══════════════════ MOBILE BASE ════════════════════════════════════ -->
+    <!--
+      Geometry verification (all z in world frame, base at z=0.15):
+        chassis bottom : 0.15 − 0.075 = 0.075 m
+        wheel center   : 0.15 − 0.05  = 0.100 m  → bottom = 0.100 − 0.10 = 0.000 ✓
+        caster center  : 0.15 − 0.12  = 0.030 m  → bottom = 0.030 − 0.03 = 0.000 ✓
+        caster top     : 0.030 + 0.03 = 0.060 m  < 0.075 (chassis bottom) ✓
+    -->
+    <body name="base" pos="0 0 0.15">
+      <freejoint name="root"/>
+
+      <!-- Chassis -->
+      <geom name="chassis" type="box" size="0.25 0.20 0.075"
+            mass="8.0" class="chassis"/>
+
+      <!-- Front ball casters: fixed low-friction spheres — no rotating joint needed -->
+      <geom name="caster_fl" type="sphere" size="0.030"
+            pos=" 0.20  0.10 -0.12" mass="0.05" friction="0.01 0.005 0.005"/>
+      <geom name="caster_fr" type="sphere" size="0.030"
+            pos=" 0.20 -0.10 -0.12" mass="0.05" friction="0.01 0.005 0.005"/>
+
+      <!-- IMU site at chassis top-centre (used for gyro / accel / quat sensors) -->
+      <site name="imu_site" pos="0 0 0.075" size="0.010" rgba="0.1 0.5 0.9 1"/>
+
+      <!-- ── Left drive wheel ── -->
+      <body name="wheel_left" pos="0 0.225 -0.05">
+        <joint name="wheel_left_joint" type="hinge" axis="0 1 0" class="wheel"/>
+        <geom  name="wheel_left_geom"  type="cylinder" size="0.100 0.030"
+               mass="0.50" class="wheel"/>
+      </body>
+
+      <!-- ── Right drive wheel ── -->
+      <body name="wheel_right" pos="0 -0.225 -0.05">
+        <joint name="wheel_right_joint" type="hinge" axis="0 1 0" class="wheel"/>
+        <geom  name="wheel_right_geom"  type="cylinder" size="0.100 0.030"
+               mass="0.50" class="wheel"/>
+      </body>
+
+      <!-- ══════════════════ 6-DOF ARM ═══════════════════════════════════
+           Mounted at chassis top-centre.
+           Zero pose: all joints = 0 → upper arm extends along +X (horizontal).
+           Home keyframe sets joint2 = π/2 → arm points straight up.
+           Reach from shoulder to TCP: ≈ 0.75 m (suitable for floor-to-table tasks).
+      ════════════════════════════════════════════════════════════════════ -->
+
+      <!-- JOINT 1 — Shoulder pan (rotation around vertical Z) -->
+      <body name="shoulder_pan_link" pos="0 0 0.075">
+        <joint name="joint1" type="hinge" axis="0 0 1"
+               range="-3.14159 3.14159" class="arm"
+               damping="5.0" armature="0.10" frictionloss="0.5"/>
+        <geom name="shoulder_pan_geom" type="cylinder" size="0.065 0.040"
+              mass="0.80" class="arm"/>
+
+        <!-- JOINT 2 — Shoulder lift (tilt arm forward/back around Y) -->
+        <body name="shoulder_lift_link" pos="0 0 0.040">
+          <joint name="joint2" type="hinge" axis="0 1 0"
+                 range="-1.5708 3.14159" class="arm"
+                 damping="5.0" armature="0.10" frictionloss="0.5"/>
+          <!-- Upper arm: 300 mm capsule along +X when joint2 = 0 -->
+          <geom name="upper_arm_geom" type="capsule"
+                fromto="0 0 0  0.30 0 0" size="0.035"
+                mass="1.50" class="arm"/>
+
+          <!-- JOINT 3 — Elbow (bend around Y) -->
+          <body name="elbow_link" pos="0.30 0 0">
+            <joint name="joint3" type="hinge" axis="0 1 0"
+                   range="-3.14159 3.14159" class="arm"
+                   damping="3.0" armature="0.05" frictionloss="0.2"/>
+            <!-- Forearm: 260 mm capsule along +X -->
+            <geom name="forearm_geom" type="capsule"
+                  fromto="0 0 0  0.26 0 0" size="0.028"
+                  mass="1.00" class="arm"/>
+
+            <!-- JOINT 4 — Wrist 1 (tilt around Y) -->
+            <body name="wrist_1_link" pos="0.26 0 0">
+              <joint name="joint4" type="hinge" axis="0 1 0"
+                     range="-3.14159 3.14159" class="wrist"/>
+              <geom name="wrist_1_geom" type="cylinder" size="0.025 0.045"
+                    mass="0.25" class="wrist"/>
+
+              <!-- JOINT 5 — Wrist 2 (rotate around Z) -->
+              <body name="wrist_2_link" pos="0.045 0 0">
+                <joint name="joint5" type="hinge" axis="0 0 1"
+                       range="-3.14159 3.14159" class="wrist"/>
+                <geom name="wrist_2_geom" type="cylinder" size="0.022 0.040"
+                      mass="0.20" class="wrist"/>
+
+                <!-- JOINT 6 — Wrist 3 / tool roll (rotate around X) -->
+                <body name="wrist_3_link" pos="0.040 0 0">
+                  <joint name="joint6" type="hinge" axis="1 0 0"
+                         range="-3.14159 3.14159" class="wrist"
+                         damping="0.5" armature="0.002"/>
+                  <geom name="wrist_3_geom" type="cylinder" size="0.020 0.025"
+                        mass="0.15" class="wrist"/>
+
+                  <!-- Force-torque sensor site (between wrist and gripper) -->
+                  <site name="ft_site" pos="0.025 0 0" size="0.008"
+                        rgba="0.1 0.5 0.9 1"/>
+
+                  <!-- ══════════ PARALLEL GRIPPER ══════════
+                       Finger geometry (relative to gripper_base origin):
+                         Closed: inner face at y = ±0.019 m → 38 mm gap
+                         Open  : inner face at y = ±0.059 m → 118 mm gap
+                       Covers all YCB objects (max ~100 mm).
+                  ══════════════════════════════════════════ -->
+                  <body name="gripper_base" pos="0.025 0 0">
+                    <geom name="gripper_palm" type="box" size="0.035 0.030 0.015"
+                          mass="0.15" rgba="0.55 0.55 0.55 1"/>
+
+                    <!-- Left finger: slides outward (+Y) to open -->
+                    <body name="finger_left" pos="0.015 0.025 0">
+                      <joint name="finger_left_joint" type="slide" axis="0 1 0"
+                             range="0 0.040" class="gripper"/>
+                      <geom name="finger_left_body" type="box"
+                            size="0.020 0.006 0.018"
+                            mass="0.04" class="gripper"/>
+                      <!-- High-friction rubber tip -->
+                      <geom name="tip_left" type="sphere" pos="0.020 0 0"
+                            size="0.007" mass="0.005"
+                            rgba="0.15 0.75 0.15 1" friction="3.0 1.0 1.0"/>
+                      <site name="touch_left_site"  pos="0.020 0 0" size="0.007"/>
+                    </body>
+
+                    <!-- Right finger: slides outward (-Y) to open -->
+                    <body name="finger_right" pos="0.015 -0.025 0">
+                      <joint name="finger_right_joint" type="slide" axis="0 -1 0"
+                             range="0 0.040" class="gripper"/>
+                      <geom name="finger_right_body" type="box"
+                            size="0.020 0.006 0.018"
+                            mass="0.04" class="gripper"/>
+                      <geom name="tip_right" type="sphere" pos="0.020 0 0"
+                            size="0.007" mass="0.005"
+                            rgba="0.15 0.75 0.15 1" friction="3.0 1.0 1.0"/>
+                      <site name="touch_right_site" pos="0.020 0 0" size="0.007"/>
+                    </body>
+
+                    <!-- Tool Centre Point: midpoint between closed fingertips -->
+                    <site name="ee_site" pos="0.042 0 0" size="0.008"
+                          rgba="0.15 0.75 0.15 1"/>
+                  </body>
+                  <!-- ════════════════════════════════════════ -->
+
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+      <!-- ═══════════════════ END ARM ══════════════════════════════════════ -->
+
+    </body>
+    <!-- ════════════════════ END BASE ════════════════════════════════════ -->
+
+  </worldbody>
+
+  <!-- ══════════════════════════════════════════════════════════════════════
+       ACTUATORS  (nu = 9)
+       ══════════════════════════════════════════════════════════════════════ -->
+  <actuator>
+    <!-- Differential drive — velocity control (ctrl units: rad/s at wheel joint) -->
+    <!-- gear=8: output torque = kv × gear × velocity_error                       -->
+    <velocity name="drive_left"  joint="wheel_left_joint"  kv="25" gear="8"/>
+    <velocity name="drive_right" joint="wheel_right_joint" kv="25" gear="8"/>
+
+    <!-- Arm — position control; kp (stiffness) decreases toward the tip -->
+    <position name="arm_j1" joint="joint1" kp="400" ctrlrange="-3.14159 3.14159"/>
+    <position name="arm_j2" joint="joint2" kp="400" ctrlrange="-1.5708  3.14159"/>
+    <position name="arm_j3" joint="joint3" kp="250" ctrlrange="-3.14159 3.14159"/>
+    <position name="arm_j4" joint="joint4" kp="80"  ctrlrange="-3.14159 3.14159"/>
+    <position name="arm_j5" joint="joint5" kp="80"  ctrlrange="-3.14159 3.14159"/>
+    <position name="arm_j6" joint="joint6" kp="40"  ctrlrange="-3.14159 3.14159"/>
+
+    <!-- Gripper — one actuator drives left finger; equality couples right finger -->
+    <position name="gripper" joint="finger_left_joint" kp="300" ctrlrange="0 0.040"/>
+  </actuator>
+
+  <!-- ══════════════════════════════════════════════════════════════════════
+       SENSORS  (22 objects · 48 float outputs)
+       ══════════════════════════════════════════════════════════════════════ -->
+  <sensor>
+    <!-- IMU (mounted at chassis top-centre) -->
+    <gyro          name="imu_gyro"   site="imu_site"  noise="0.002"/>
+    <accelerometer name="imu_accel"  site="imu_site"  noise="0.010"/>
+    <framequat     name="imu_quat"   objtype="site" objname="imu_site"/>
+
+    <!-- Base velocity in world frame -->
+    <framelinvel name="base_linvel"  objtype="body" objname="base"/>
+    <frameangvel name="base_angvel"  objtype="body" objname="base"/>
+
+    <!-- Arm joint positions (radians) -->
+    <jointpos name="q1" joint="joint1"/>
+    <jointpos name="q2" joint="joint2"/>
+    <jointpos name="q3" joint="joint3"/>
+    <jointpos name="q4" joint="joint4"/>
+    <jointpos name="q5" joint="joint5"/>
+    <jointpos name="q6" joint="joint6"/>
+
+    <!-- Arm joint velocities (rad/s) -->
+    <jointvel name="dq1" joint="joint1"/>
+    <jointvel name="dq2" joint="joint2"/>
+    <jointvel name="dq3" joint="joint3"/>
+    <jointvel name="dq4" joint="joint4"/>
+    <jointvel name="dq5" joint="joint5"/>
+    <jointvel name="dq6" joint="joint6"/>
+
+    <!-- Wrist force-torque (6-axis) -->
+    <force  name="wrist_force"  site="ft_site" noise="0.5"/>
+    <torque name="wrist_torque" site="ft_site" noise="0.05"/>
+
+    <!-- Gripper state -->
+    <jointpos name="finger_l" joint="finger_left_joint"/>
+    <jointpos name="finger_r" joint="finger_right_joint"/>
+
+    <!-- Binary touch signals on fingertips (non-zero = contact) -->
+    <touch name="touch_left"  site="touch_left_site"/>
+    <touch name="touch_right" site="touch_right_site"/>
+
+    <!-- End-effector pose and velocity in world frame -->
+    <framepos  name="ee_pos"    objtype="site" objname="ee_site"/>
+    <framequat name="ee_quat"   objtype="site" objname="ee_site"/>
+    <framelinvel name="ee_linvel" objtype="site" objname="ee_site"/>
+  </sensor>
+
+  <!-- ══════════════════════════════════════════════════════════════════════
+       EQUALITY CONSTRAINTS
+       ══════════════════════════════════════════════════════════════════════ -->
+  <equality>
+    <!-- Keep both gripper fingers symmetric: finger_right = finger_left -->
+    <joint name="gripper_coupling"
+           joint1="finger_left_joint" joint2="finger_right_joint"
+           polycoef="0 1 0 0 0"/>
+  </equality>
+
+  <!-- ══════════════════════════════════════════════════════════════════════
+       KEYFRAMES
+       qpos layout (17 values):
+         [0:3]   base xyz position
+         [3:7]   base quaternion wxyz
+         [7]     wheel_left_joint
+         [8]     wheel_right_joint
+         [9]     joint1  (shoulder pan)
+         [10]    joint2  (shoulder lift)
+         [11]    joint3  (elbow)
+         [12]    joint4  (wrist 1)
+         [13]    joint5  (wrist 2)
+         [14]    joint6  (wrist 3)
+         [15]    finger_left_joint
+         [16]    finger_right_joint
+
+       ctrl layout (9 values):
+         [0]     drive_left
+         [1]     drive_right
+         [2]     arm_j1
+         [3]     arm_j2
+         [4]     arm_j3
+         [5]     arm_j4
+         [6]     arm_j5
+         [7]     arm_j6
+         [8]     gripper
+       ══════════════════════════════════════════════════════════════════════ -->
+  <keyframe>
+    <!--
+      home: arm straight up (joint2 = π/2), elbow/wrist neutral, gripper closed.
+      Safe transport pose — no horizontal reach, minimal collision risk.
+    -->
+    <key name="home"
+         qpos="0 0 0.15  1 0 0 0  0 0  0 1.5708 0 0 0 0  0 0"
+         ctrl="0 0  0 1.5708 0 0 0 0  0"/>
+
+    <!--
+      ready: arm angled forward to approach objects on a 0.4 m table.
+      joint2 = π/4  → upper arm at 45° from horizontal
+      joint3 = −π/3 → elbow bent 60°, forearm pointing forward-down
+    -->
+    <key name="ready"
+         qpos="0 0 0.15  1 0 0 0  0 0  0 0.7854 -1.0472 0 0 0  0 0"
+         ctrl="0 0  0 0.7854 -1.0472 0 0 0  0"/>
+
+    <!--
+      grasp_open: arm angled forward, gripper fully open (0.04 m per finger = 118 mm gap).
+    -->
+    <key name="grasp_open"
+         qpos="0 0 0.15  1 0 0 0  0 0  0 0.7854 -1.0472 0 0 0  0.04 0.04"
+         ctrl="0 0  0 0.7854 -1.0472 0 0 0  0.04"/>
+  </keyframe>
+
+</mujoco>
