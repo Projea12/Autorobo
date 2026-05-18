@@ -36,7 +36,12 @@ _WALL_COLOUR     = [0.30, 0.30, 0.35, 1.0]
 _WALL_STRIPE     = [0.80, 0.80, 0.10, 1.0]   # yellow warning stripe near top
 _BOX_COLOUR      = [0.70, 0.40, 0.10, 1.0]
 _CYLINDER_COLOUR = [0.20, 0.55, 0.20, 1.0]
-_GOAL_COLOUR     = [0.00, 0.85, 0.20, 0.6]
+_GOAL_DISC       = [0.00, 0.90, 0.25, 0.75]   # translucent green flat disc
+_GOAL_SPHERE     = [0.00, 1.00, 0.30, 0.85]   # bright green floating sphere
+_GOAL_BEACON     = [0.00, 1.00, 0.50, 0.30]   # tall translucent beacon pillar
+_GOAL_LINE       = [0.00, 0.95, 0.30]          # RGB for debug lines (no alpha)
+_GOAL_PULSE_A    = [0.00, 1.00, 0.30, 0.85]   # bright state for pulse
+_GOAL_PULSE_B    = [0.00, 0.55, 0.15, 0.40]   # dim  state for pulse
 
 
 @dataclass
@@ -130,7 +135,13 @@ class World:
         self._named_wall_ids: dict            = {}
         self._static_ids:     List[int]       = []   # mass = 0
         self._dynamic_ids:    List[int]       = []   # mass > 0, physics-driven
-        self._goal_id:        Optional[int]   = None
+        # goal marker — multiple body + debug-line ids
+        self._goal_id:         Optional[int]   = None   # disc body
+        self._goal_sphere_id:  Optional[int]   = None   # floating sphere
+        self._goal_beacon_id:  Optional[int]   = None   # tall pillar
+        self._goal_line_ids:   List[int]        = []     # debug lines
+        self._goal_pos:        Optional[Tuple[float, float]] = None
+        self._pulse_bright:    bool             = True   # toggle for pulse()
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -153,7 +164,7 @@ class World:
             + self._wall_ids
             + self._static_ids
             + self._dynamic_ids
-            + [self._goal_id]
+            + [self._goal_id, self._goal_sphere_id, self._goal_beacon_id]
         )
         for body_id in all_ids:
             if body_id is not None:
@@ -161,38 +172,69 @@ class World:
                     p.removeBody(body_id, physicsClientId=self._client)
                 except Exception:
                     pass
-        self._floor_id       = None
-        self._wall_ids       = []
-        self._named_wall_ids = {}
-        self._static_ids     = []
-        self._dynamic_ids    = []
-        self._goal_id        = None
+        for line_id in self._goal_line_ids:
+            try:
+                p.removeUserDebugItem(line_id, physicsClientId=self._client)
+            except Exception:
+                pass
+        self._floor_id        = None
+        self._wall_ids        = []
+        self._named_wall_ids  = {}
+        self._static_ids      = []
+        self._dynamic_ids     = []
+        self._goal_id         = None
+        self._goal_sphere_id  = None
+        self._goal_beacon_id  = None
+        self._goal_line_ids   = []
+        self._goal_pos        = None
 
     def sample_goal(
         self,
-        min_dist_from_centre: float = 0.5,
+        min_dist_from_centre: float = 0.8,
         margin: float = 0.5,
     ) -> Tuple[float, float]:
         """
-        Return a random (x, y) goal position inside the arena.
-
-        Parameters
-        ----------
-        min_dist_from_centre : avoid spawning right at origin
-        margin               : keep this far from each wall
+        Pick a random (x, y) goal clear of walls and the robot spawn zone,
+        draw the full goal marker, and return the position.
         """
         half = self._cfg.arena_size / 2.0 - margin
-        for _ in range(200):
+        for _ in range(300):
             x = self._rng.uniform(-half, half)
             y = self._rng.uniform(-half, half)
             if math.hypot(x, y) >= min_dist_from_centre:
                 self._place_goal_marker(x, y)
                 return (x, y)
-        return (half * 0.5, half * 0.5)   # deterministic fallback
+        fallback = (half * 0.6, half * 0.6)
+        self._place_goal_marker(*fallback)
+        return fallback
 
-    def place_goal_marker(self, x: float, y: float, z: float = 0.01) -> None:
-        """Draw a flat green disc at (x, y) to show the goal visually."""
-        self._place_goal_marker(x, y, z)
+    def place_goal_marker(self, x: float, y: float) -> None:
+        """Explicitly place the goal marker at (x, y)."""
+        self._place_goal_marker(x, y)
+
+    @property
+    def goal_position(self) -> Optional[Tuple[float, float]]:
+        """Last placed goal (x, y), or None if not yet placed."""
+        return self._goal_pos
+
+    def pulse_goal(self) -> None:
+        """
+        Alternate the goal sphere between bright and dim colours.
+        Call once per sim step (or every N steps) to create a pulsing effect.
+
+        Example in training loop:
+            if step % 10 == 0:
+                world.pulse_goal()
+        """
+        if self._goal_sphere_id is None:
+            return
+        colour = _GOAL_PULSE_A if self._pulse_bright else _GOAL_PULSE_B
+        p.changeVisualShape(
+            self._goal_sphere_id, -1,
+            rgbaColor=colour,
+            physicsClientId=self._client,
+        )
+        self._pulse_bright = not self._pulse_bright
 
     # ── body-id accessors ─────────────────────────────────────────────────────
 
@@ -682,27 +724,144 @@ class World:
         else:
             self._static_ids.append(body_id)
 
-    def _place_goal_marker(self, x: float, y: float, z: float = 0.01) -> None:
-        if self._goal_id is not None:
+    def _clear_goal(self) -> None:
+        """Remove all existing goal visuals before placing a new one."""
+        for body_id in [self._goal_id, self._goal_sphere_id, self._goal_beacon_id]:
+            if body_id is not None:
+                try:
+                    p.removeBody(body_id, physicsClientId=self._client)
+                except Exception:
+                    pass
+        for line_id in self._goal_line_ids:
             try:
-                p.removeBody(self._goal_id, physicsClientId=self._client)
+                p.removeUserDebugItem(line_id, physicsClientId=self._client)
             except Exception:
                 pass
+        self._goal_id        = None
+        self._goal_sphere_id = None
+        self._goal_beacon_id = None
+        self._goal_line_ids  = []
 
-        # flat disc — visual only (mass=0, no collision shape needed)
-        visual_id = p.createVisualShape(
+    def _place_goal_marker(self, x: float, y: float) -> None:
+        """
+        Build the goal marker — 4 visual layers + debug annotations.
+
+        Layer 1 — Flat disc (ground level)
+        ────────────────────────────────────
+        A wide flat cylinder (r=0.20 m, h=0.01 m) lying on the floor.
+        Translucent green — easy to see without occluding the robot.
+        No collision shape (collisionIndex=-1) so the robot drives over it.
+
+        Layer 2 — Floating sphere
+        ──────────────────────────
+        A sphere (r=0.10 m) hovering 0.35 m above the disc centre.
+        This is the primary visual target the agent should navigate toward.
+        Supports pulse_goal() colour toggling between steps.
+
+        Layer 3 — Beacon pillar
+        ─────────────────────────
+        A tall thin cylinder (r=0.03 m, h=1.20 m) rising from the centre.
+        Visible from anywhere in the arena — acts like a lighthouse.
+
+        Layer 4 — Debug crosshairs + vertical beacon line
+        ──────────────────────────────────────────────────
+        Four p.addUserDebugLine rays from the disc centre outward (±X, ±Y),
+        plus a vertical line from floor to sphere height.
+        Lines are cheap to draw and do not cost collision checks.
+
+        Layer 5 — Text label
+        ──────────────────────
+        "GOAL" floating above the sphere.
+        """
+        self._clear_goal()
+        self._goal_pos = (x, y)
+
+        # ── Layer 1: ground disc ─────────────────────────────────────────────
+        disc_vis = p.createVisualShape(
             p.GEOM_CYLINDER,
-            radius=0.15,
-            length=0.02,
-            rgbaColor=_GOAL_COLOUR,
+            radius=0.20,
+            length=0.01,
+            rgbaColor=_GOAL_DISC,
             physicsClientId=self._client,
         )
         self._goal_id = p.createMultiBody(
             baseMass=0,
-            baseVisualShapeIndex=visual_id,
-            basePosition=[x, y, z],
+            baseCollisionShapeIndex=-1,   # no collision — robot rolls over it
+            baseVisualShapeIndex=disc_vis,
+            basePosition=[x, y, 0.005],
             physicsClientId=self._client,
         )
+
+        # ── Layer 2: floating sphere ─────────────────────────────────────────
+        sphere_vis = p.createVisualShape(
+            p.GEOM_SPHERE,
+            radius=0.10,
+            rgbaColor=_GOAL_SPHERE,
+            physicsClientId=self._client,
+        )
+        self._goal_sphere_id = p.createMultiBody(
+            baseMass=0,
+            baseCollisionShapeIndex=-1,
+            baseVisualShapeIndex=sphere_vis,
+            basePosition=[x, y, 0.35],
+            physicsClientId=self._client,
+        )
+
+        # ── Layer 3: beacon pillar ───────────────────────────────────────────
+        beacon_vis = p.createVisualShape(
+            p.GEOM_CYLINDER,
+            radius=0.025,
+            length=1.20,
+            rgbaColor=_GOAL_BEACON,
+            physicsClientId=self._client,
+        )
+        self._goal_beacon_id = p.createMultiBody(
+            baseMass=0,
+            baseCollisionShapeIndex=-1,
+            baseVisualShapeIndex=beacon_vis,
+            basePosition=[x, y, 0.60],
+            physicsClientId=self._client,
+        )
+
+        # ── Layer 4: debug lines ─────────────────────────────────────────────
+        arm   = 0.30   # crosshair arm length
+        z_cr  = 0.02   # just above floor
+        z_top = 0.40   # top of vertical beacon line
+
+        # crosshair — 4 outward rays in ±X and ±Y
+        crosshair_specs = [
+            ([x,       y,       z_cr], [x + arm, y,       z_cr]),  # +X
+            ([x,       y,       z_cr], [x - arm, y,       z_cr]),  # −X
+            ([x,       y,       z_cr], [x,       y + arm, z_cr]),  # +Y
+            ([x,       y,       z_cr], [x,       y - arm, z_cr]),  # −Y
+        ]
+        for start, end in crosshair_specs:
+            lid = p.addUserDebugLine(
+                start, end,
+                lineColorRGB=_GOAL_LINE,
+                lineWidth=2,
+                physicsClientId=self._client,
+            )
+            self._goal_line_ids.append(lid)
+
+        # vertical beacon line floor → sphere
+        lid = p.addUserDebugLine(
+            [x, y, 0.01], [x, y, z_top],
+            lineColorRGB=_GOAL_LINE,
+            lineWidth=1,
+            physicsClientId=self._client,
+        )
+        self._goal_line_ids.append(lid)
+
+        # ── Layer 5: text label ──────────────────────────────────────────────
+        lid = p.addUserDebugText(
+            "GOAL",
+            [x, y, 0.55],
+            textColorRGB=[0.0, 1.0, 0.4],
+            textSize=1.4,
+            physicsClientId=self._client,
+        )
+        self._goal_line_ids.append(lid)
 
     # ── primitive factories ───────────────────────────────────────────────────
 
