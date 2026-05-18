@@ -41,27 +41,53 @@ _GOAL_COLOUR     = [0.00, 0.85, 0.20, 0.6]
 
 @dataclass
 class ObstacleConfig:
-    """Specification for a single obstacle."""
-    shape:    str            # "box" | "cylinder"
+    """
+    Specification for a single obstacle.
+
+    shape    : "box" | "cylinder"
+    position : (x, y, z) — z is the centre height, not the base
+    size     : box → (lx, ly, lz) full lengths
+               cylinder → (radius, height)
+    yaw      : rotation about Z in radians (boxes only)
+    mass     : kg — 0 = static/immovable,  >0 = dynamic (physics-driven)
+    dynamic  : convenience flag; sets mass to 1.0 if True and mass==0
+    colour   : override RGBA; None uses shape-default colour
+    velocity : initial (vx, vy) for dynamic obstacles (m/s)
+    """
+    shape:    str
     position: Tuple[float, float, float]
-    size:     Tuple          # box: (lx, ly, lz)  cylinder: (radius, height)
-    yaw:      float = 0.0   # rotation about Z in radians
+    size:     Tuple
+    yaw:      float                          = 0.0
+    mass:     float                          = 0.0
+    dynamic:  bool                           = False
+    colour:   Optional[List[float]]          = None
+    velocity: Tuple[float, float]            = (0.0, 0.0)
+
+    def __post_init__(self) -> None:
+        if self.dynamic and self.mass == 0.0:
+            self.mass = 1.0
 
 
 @dataclass
 class WorldConfig:
     """Top-level arena configuration."""
-    arena_size:     float = 6.0     # full side length — arena spans ±arena_size/2
-    wall_height:    float = 0.5
-    wall_thickness: float = 0.05
-    num_obstacles:  int   = 10
-    seed:           Optional[int] = None
-    # "plane" → infinite plane.urdf (fast, no boundary box needed)
-    # "box"   → explicit flat box sized to arena_size (visible edges, grid lines)
-    floor_type:     str   = "plane"
-    floor_thickness: float = 0.02   # only used when floor_type == "box"
-    grid_lines:     bool  = True    # draw 1 m grid on box floor (GUI only)
-    # fixed obstacles — if empty, obstacles are randomly generated
+    arena_size:      float = 6.0
+    wall_height:     float = 0.5
+    wall_thickness:  float = 0.05
+    # obstacle count — random count chosen in [min_obstacles, max_obstacles]
+    min_obstacles:   int   = 5
+    max_obstacles:   int   = 10
+    # fraction of random obstacles that are dynamic (0.0–1.0)
+    dynamic_ratio:   float = 0.3
+    # dynamic obstacle speed range (m/s)
+    dynamic_speed_min: float = 0.3
+    dynamic_speed_max: float = 0.8
+    seed:            Optional[int] = None
+    # "plane" → infinite plane.urdf  |  "box" → bounded explicit box
+    floor_type:      str   = "plane"
+    floor_thickness: float = 0.02
+    grid_lines:      bool  = True
+    # supply fixed_obstacles to skip random generation entirely
     fixed_obstacles: List[ObstacleConfig] = field(default_factory=list)
 
 
@@ -82,24 +108,29 @@ class World:
         self,
         client:        int,
         arena_size:    float = 6.0,
-        num_obstacles: int   = 10,
+        num_obstacles: int   = 8,    # shortcut — sets min=max=num_obstacles
         seed:          Optional[int] = None,
         config:        Optional[WorldConfig] = None,
     ) -> None:
         self._client = client
-        self._cfg    = config or WorldConfig(
-            arena_size=arena_size,
-            num_obstacles=num_obstacles,
-            seed=seed,
-        )
+        if config is not None:
+            self._cfg = config
+        else:
+            self._cfg = WorldConfig(
+                arena_size=arena_size,
+                min_obstacles=num_obstacles,
+                max_obstacles=num_obstacles,
+                seed=seed,
+            )
         self._rng = random.Random(self._cfg.seed)
 
         # body-id registries
-        self._floor_id:      Optional[int]       = None
-        self._wall_ids:      List[int]            = []
-        self._named_wall_ids: dict                = {}   # {"north": id, ...}
-        self._obstacle_ids:  List[int]            = []
-        self._goal_id:       Optional[int]        = None
+        self._floor_id:       Optional[int]  = None
+        self._wall_ids:       List[int]       = []
+        self._named_wall_ids: dict            = {}
+        self._static_ids:     List[int]       = []   # mass = 0
+        self._dynamic_ids:    List[int]       = []   # mass > 0, physics-driven
+        self._goal_id:        Optional[int]   = None
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -117,9 +148,14 @@ class World:
 
     def reset(self) -> None:
         """Remove every arena body from the simulation."""
-        for body_id in (
-            [self._floor_id] + self._wall_ids + self._obstacle_ids + [self._goal_id]
-        ):
+        all_ids = (
+            [self._floor_id]
+            + self._wall_ids
+            + self._static_ids
+            + self._dynamic_ids
+            + [self._goal_id]
+        )
+        for body_id in all_ids:
             if body_id is not None:
                 try:
                     p.removeBody(body_id, physicsClientId=self._client)
@@ -128,7 +164,8 @@ class World:
         self._floor_id       = None
         self._wall_ids       = []
         self._named_wall_ids = {}
-        self._obstacle_ids   = []
+        self._static_ids     = []
+        self._dynamic_ids    = []
         self._goal_id        = None
 
     def sample_goal(
@@ -161,7 +198,20 @@ class World:
 
     @property
     def obstacle_ids(self) -> List[int]:
-        return list(self._obstacle_ids)
+        """All obstacle body ids (static + dynamic)."""
+        return self._static_ids + self._dynamic_ids
+
+    @property
+    def static_obstacle_ids(self) -> List[int]:
+        return list(self._static_ids)
+
+    @property
+    def dynamic_obstacle_ids(self) -> List[int]:
+        return list(self._dynamic_ids)
+
+    @property
+    def obstacle_count(self) -> int:
+        return len(self._static_ids) + len(self._dynamic_ids)
 
     @property
     def wall_ids(self) -> List[int]:
@@ -172,12 +222,27 @@ class World:
         try:
             return self._named_wall_ids[face]
         except KeyError:
-            raise KeyError(f"No wall named {face!r}. Choose from {list(self._named_wall_ids)}")
+            raise KeyError(
+                f"No wall named {face!r}. "
+                f"Choose from {list(self._named_wall_ids)}"
+            )
 
     @property
     def all_obstacle_ids(self) -> List[int]:
-        """Walls + obstacles — everything a LiDAR ray can hit."""
-        return self._wall_ids + self._obstacle_ids
+        """Walls + all obstacles — everything a LiDAR ray can hit."""
+        return self._wall_ids + self._static_ids + self._dynamic_ids
+
+    def step_dynamic_obstacles(self) -> None:
+        """
+        Called once per simulation step to keep dynamic obstacles moving.
+
+        PyBullet's physics engine handles wall/obstacle collisions automatically
+        because each dynamic body has mass > 0 and restitution = 0.8.
+        This method does nothing extra — it exists as a hook so the env loop
+        can call `world.step_dynamic_obstacles()` each step without needing
+        to know whether dynamics are enabled.
+        """
+        pass   # physics engine drives movement; hook kept for custom overrides
 
     # ── internal builders ─────────────────────────────────────────────────────
 
