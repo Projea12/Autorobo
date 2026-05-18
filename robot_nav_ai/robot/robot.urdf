@@ -16,6 +16,12 @@
   <material name="black">
     <color rgba="0.0 0.0 0.0 1.0"/>
   </material>
+  <material name="rubber">
+    <color rgba="0.08 0.08 0.08 1.0"/>
+  </material>
+  <material name="silver">
+    <color rgba="0.75 0.75 0.75 1.0"/>
+  </material>
 
   <!-- ═══════════════════════════════════════════
        BASE FOOTPRINT
@@ -101,71 +107,152 @@
   </link>
 
   <!-- ═══════════════════════════════════════════
-       LEFT WHEEL
+       LEFT DRIVE WHEEL
+
+       Geometry   : cylinder  r=0.05 m  width=0.04 m
+       Mass       : 0.5 kg  (rubber tyre + aluminium hub)
+       Spin axis  : Y  →  Iyy is the "easy" spin inertia
+
+       Inertia for solid cylinder, axis along Y:
+         Iyy = ½·m·r²          = 0.5·0.5·0.0025  = 0.000625  kg·m²
+         Ixx = Izz = m/12·(3r²+l²) = 0.5/12·(0.0075+0.0016) = 0.000379  kg·m²
+
+       Placement  : x= 0.0  (wheel axle at chassis midpoint)
+                    y=+0.17 m  (chassis half-width 0.15 + wheel half-width 0.02)
+                    z= 0.0  (wheel centre at chassis mid-height)
   ═══════════════════════════════════════════ -->
   <link name="left_wheel">
+
     <inertial>
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <mass value="0.5"/>
-      <inertia ixx="0.001" ixy="0.0" ixz="0.0"
-               iyy="0.001" iyz="0.0"
-               izz="0.002"/>
+      <inertia ixx="0.000379" ixy="0.0" ixz="0.0"
+               iyy="0.000625" iyz="0.0"
+               izz="0.000379"/>
     </inertial>
+
+    <!-- VISUAL 1: rubber tyre (outer ring) -->
     <visual>
       <origin xyz="0 0 0" rpy="1.5708 0 0"/>
       <geometry>
         <cylinder radius="0.05" length="0.04"/>
       </geometry>
+      <material name="rubber"/>
+    </visual>
+
+    <!-- VISUAL 2: aluminium hub (inner disc) -->
+    <visual>
+      <origin xyz="0 0.021 0" rpy="1.5708 0 0"/>
+      <geometry>
+        <cylinder radius="0.025" length="0.003"/>
+      </geometry>
+      <material name="silver"/>
+    </visual>
+
+    <!-- VISUAL 3: hub bolt circle (decorative cross) -->
+    <visual>
+      <origin xyz="0 0.022 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.008 0.003 0.040"/>
+      </geometry>
       <material name="black"/>
     </visual>
+    <visual>
+      <origin xyz="0 0.022 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.040 0.003 0.008"/>
+      </geometry>
+      <material name="black"/>
+    </visual>
+
+    <!-- COLLISION: single cylinder — keeps physics stable -->
     <collision>
       <origin xyz="0 0 0" rpy="1.5708 0 0"/>
       <geometry>
         <cylinder radius="0.05" length="0.04"/>
       </geometry>
     </collision>
+
   </link>
 
+  <!-- continuous joint — no position limit, motor drives velocity -->
   <joint name="left_wheel_joint" type="continuous">
     <parent link="base_link"/>
     <child link="left_wheel"/>
-    <origin xyz="0.1 0.17 0.0" rpy="0 0 0"/>
+    <origin xyz="0.0 0.17 0.0" rpy="0 0 0"/>
     <axis xyz="0 1 0"/>
-    <dynamics damping="0.1" friction="0.1"/>
+    <limit effort="10.0" velocity="10.0"/>
+    <dynamics damping="0.05" friction="0.05"/>
   </joint>
 
   <!-- ═══════════════════════════════════════════
-       RIGHT WHEEL
+       RIGHT DRIVE WHEEL  (mirror of left)
+
+       Geometry / mass / inertia identical to left wheel.
+       Placement  : y = −0.17 m  (opposite side)
+                    hub face points outward at y = −0.021
   ═══════════════════════════════════════════ -->
   <link name="right_wheel">
+
     <inertial>
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <mass value="0.5"/>
-      <inertia ixx="0.001" ixy="0.0" ixz="0.0"
-               iyy="0.001" iyz="0.0"
-               izz="0.002"/>
+      <inertia ixx="0.000379" ixy="0.0" ixz="0.0"
+               iyy="0.000625" iyz="0.0"
+               izz="0.000379"/>
     </inertial>
+
+    <!-- VISUAL 1: rubber tyre -->
     <visual>
       <origin xyz="0 0 0" rpy="1.5708 0 0"/>
       <geometry>
         <cylinder radius="0.05" length="0.04"/>
       </geometry>
+      <material name="rubber"/>
+    </visual>
+
+    <!-- VISUAL 2: aluminium hub (faces outward → negative Y) -->
+    <visual>
+      <origin xyz="0 -0.021 0" rpy="1.5708 0 0"/>
+      <geometry>
+        <cylinder radius="0.025" length="0.003"/>
+      </geometry>
+      <material name="silver"/>
+    </visual>
+
+    <!-- VISUAL 3: hub bolt circle -->
+    <visual>
+      <origin xyz="0 -0.022 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.008 0.003 0.040"/>
+      </geometry>
       <material name="black"/>
     </visual>
+    <visual>
+      <origin xyz="0 -0.022 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.040 0.003 0.008"/>
+      </geometry>
+      <material name="black"/>
+    </visual>
+
+    <!-- COLLISION -->
     <collision>
       <origin xyz="0 0 0" rpy="1.5708 0 0"/>
       <geometry>
         <cylinder radius="0.05" length="0.04"/>
       </geometry>
     </collision>
+
   </link>
 
   <joint name="right_wheel_joint" type="continuous">
     <parent link="base_link"/>
     <child link="right_wheel"/>
-    <origin xyz="0.1 -0.17 0.0" rpy="0 0 0"/>
+    <origin xyz="0.0 -0.17 0.0" rpy="0 0 0"/>
     <axis xyz="0 1 0"/>
-    <dynamics damping="0.1" friction="0.1"/>
+    <limit effort="10.0" velocity="10.0"/>
+    <dynamics damping="0.05" friction="0.05"/>
   </joint>
 
   <!-- ═══════════════════════════════════════════
