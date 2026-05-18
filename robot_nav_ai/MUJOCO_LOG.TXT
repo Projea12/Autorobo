@@ -352,3 +352,6 @@ WARNING: Nan, Inf or huge value in QACC at DOF 2. The simulation is unstable. Ti
 Mon May 18 17:03:24 2026
 WARNING: Nan, Inf or huge value in QVEL at DOF 6. The simulation is unstable. Time = 0.0040.
 
+Mon May 18 18:13:44 2026
+WARNING: EPA: out of memory for faces on expanding polytope
+
