@@ -135,6 +135,8 @@ class World:
         self._named_wall_ids: dict            = {}
         self._static_ids:     List[int]       = []   # mass = 0
         self._dynamic_ids:    List[int]       = []   # mass > 0, physics-driven
+        # (x, y, footprint_radius) for every placed obstacle — used by randomise_goal
+        self._obstacle_footprints: List[Tuple[float, float, float]] = []
         # goal marker — multiple body + debug-line ids
         self._goal_id:         Optional[int]   = None   # disc body
         self._goal_sphere_id:  Optional[int]   = None   # floating sphere
@@ -177,16 +179,17 @@ class World:
                 p.removeUserDebugItem(line_id, physicsClientId=self._client)
             except Exception:
                 pass
-        self._floor_id        = None
-        self._wall_ids        = []
-        self._named_wall_ids  = {}
-        self._static_ids      = []
-        self._dynamic_ids     = []
-        self._goal_id         = None
-        self._goal_sphere_id  = None
-        self._goal_beacon_id  = None
-        self._goal_line_ids   = []
-        self._goal_pos        = None
+        self._floor_id              = None
+        self._wall_ids              = []
+        self._named_wall_ids        = {}
+        self._static_ids            = []
+        self._dynamic_ids           = []
+        self._obstacle_footprints   = []
+        self._goal_id              = None
+        self._goal_sphere_id       = None
+        self._goal_beacon_id       = None
+        self._goal_line_ids        = []
+        self._goal_pos             = None
 
     def sample_goal(
         self,
@@ -285,6 +288,174 @@ class World:
         to know whether dynamics are enabled.
         """
         pass   # physics engine drives movement; hook kept for custom overrides
+
+    def randomise_obstacles(self) -> None:
+        """
+        Teleport every obstacle to a fresh random position and orientation
+        without destroying and recreating bodies — far cheaper than rebuild().
+
+        Called at the start of each episode so the robot cannot memorise a
+        fixed obstacle layout.
+
+        Strategy
+        --------
+        • Generate candidate positions with the same rejection rules used at
+          build time (clear zone, wall margin, inter-obstacle separation).
+        • Move each body with p.resetBasePositionAndOrientation — instant,
+          no physics settle time needed because we also zero velocities.
+        • For dynamic obstacles assign a fresh random velocity direction so
+          they don't all head the same way after the first episode.
+        • Update self._obstacle_footprints so randomise_goal() gets the
+          new layout when called afterwards.
+        """
+        if not self._static_ids and not self._dynamic_ids:
+            return
+
+        half    = self._cfg.arena_size / 2.0
+        margin  = 0.45
+        clear_r = 0.80
+        sep     = 0.35
+
+        all_ids = self._static_ids + self._dynamic_ids
+        new_footprints: List[Tuple[float, float, float]] = []
+
+        for body_id in all_ids:
+            is_dynamic = body_id in self._dynamic_ids
+
+            # ── sample a collision-free position ──────────────────────────────
+            placed = False
+            for _ in range(500):
+                x = self._rng.uniform(-half + margin, half - margin)
+                y = self._rng.uniform(-half + margin, half - margin)
+
+                if math.hypot(x, y) < clear_r:
+                    continue
+
+                fp_r = 0.25   # conservative footprint radius for checks
+                too_close = any(
+                    math.hypot(x - fx, y - fy) < fp_r + fr + sep
+                    for fx, fy, fr in new_footprints
+                )
+                if too_close:
+                    continue
+
+                # ── teleport ─────────────────────────────────────────────────
+                yaw = self._rng.uniform(0, 2 * math.pi)
+                orn = p.getQuaternionFromEuler([0, 0, yaw])
+
+                # read current z so height is preserved
+                cur_pos, _ = p.getBasePositionAndOrientation(
+                    body_id, physicsClientId=self._client
+                )
+                new_pos = [x, y, cur_pos[2]]
+
+                p.resetBasePositionAndOrientation(
+                    body_id, new_pos, orn,
+                    physicsClientId=self._client,
+                )
+                p.resetBaseVelocity(
+                    body_id,
+                    linearVelocity=[0, 0, 0],
+                    angularVelocity=[0, 0, 0],
+                    physicsClientId=self._client,
+                )
+
+                # ── re-kick dynamic obstacles ─────────────────────────────────
+                if is_dynamic:
+                    speed = self._rng.uniform(self._cfg.dynamic_speed_min,
+                                              self._cfg.dynamic_speed_max)
+                    angle = self._rng.uniform(0, 2 * math.pi)
+                    p.resetBaseVelocity(
+                        body_id,
+                        linearVelocity=[speed * math.cos(angle),
+                                        speed * math.sin(angle), 0],
+                        angularVelocity=[0, 0, 0],
+                        physicsClientId=self._client,
+                    )
+
+                new_footprints.append((x, y, fp_r))
+                placed = True
+                break
+
+            if not placed:
+                # arena too crowded — keep body where it is, still record it
+                pos, _ = p.getBasePositionAndOrientation(
+                    body_id, physicsClientId=self._client
+                )
+                new_footprints.append((pos[0], pos[1], 0.25))
+
+        self._obstacle_footprints = new_footprints
+
+    def randomise_goal(
+        self,
+        min_dist_from_origin: float = 0.8,
+        margin: float = 0.5,
+        goal_clear_r: float = 0.30,
+    ) -> Tuple[float, float]:
+        """
+        Place the goal in a random position that is:
+          • Inside the arena boundary (≥ margin from each wall)
+          • Not inside or on top of any obstacle footprint
+          • Not inside the robot spawn zone (≥ min_dist_from_origin from origin)
+          • Not at the same spot as the previous goal
+
+        Parameters
+        ----------
+        min_dist_from_origin : clear zone around robot spawn (metres)
+        margin               : minimum distance from each wall (metres)
+        goal_clear_r         : how far the goal must be from obstacle edges (metres)
+
+        Returns
+        -------
+        (x, y) of the placed goal.
+
+        Raises
+        ------
+        RuntimeError if no valid position found after 500 attempts (arena too full).
+        """
+        half    = self._cfg.arena_size / 2.0 - margin
+        prev    = self._goal_pos   # avoid repeating the same spot
+
+        for _ in range(500):
+            x = self._rng.uniform(-half, half)
+            y = self._rng.uniform(-half, half)
+
+            # ── reject: robot spawn zone ──────────────────────────────────────
+            if math.hypot(x, y) < min_dist_from_origin:
+                continue
+
+            # ── reject: same as previous goal ────────────────────────────────
+            if prev and math.hypot(x - prev[0], y - prev[1]) < 0.3:
+                continue
+
+            # ── reject: inside an obstacle footprint ──────────────────────────
+            in_obstacle = any(
+                math.hypot(x - fx, y - fy) < fr + goal_clear_r
+                for fx, fy, fr in self._obstacle_footprints
+            )
+            if in_obstacle:
+                continue
+
+            self._place_goal_marker(x, y)
+            return (x, y)
+
+        # Fallback: pick the position furthest from all obstacles
+        best_pos   = (half * 0.5, half * 0.5)
+        best_score = -1.0
+        for _ in range(50):
+            x = self._rng.uniform(-half, half)
+            y = self._rng.uniform(-half, half)
+            if math.hypot(x, y) < min_dist_from_origin:
+                continue
+            score = min(
+                (math.hypot(x - fx, y - fy) - fr)
+                for fx, fy, fr in self._obstacle_footprints
+            ) if self._obstacle_footprints else 999.0
+            if score > best_score:
+                best_score, best_pos = score, (x, y)
+
+        self._place_goal_marker(*best_pos)
+        return best_pos
 
     # ── internal builders ─────────────────────────────────────────────────────
 
@@ -632,7 +803,9 @@ class World:
                 )
 
             self._place_obstacle(obs)
-            footprints.append((x, y, footprint_r - sep))
+            fp = (x, y, footprint_r - sep)
+            footprints.append(fp)
+            self._obstacle_footprints.append(fp)
             placed += 1
 
     # ── colours per obstacle category ────────────────────────────────────────
