@@ -232,6 +232,7 @@ class LiDAR2D:
         site_name:   str   = DEFAULT_SITE,
         exclude_body: str  = DEFAULT_BODY,
     ) -> None:
+        self._model    = model   # stored so read() can pass to mj_ray
         self._n_rays   = n_rays
         self._max_dist = max_dist
 
@@ -267,7 +268,7 @@ class LiDAR2D:
         for i in range(self._n_rays):
             wdir = world_dirs[i]
             dist = mujoco.mj_ray(
-                data._model,          # MjModel
+                self._model,          # MjModel (stored at init)
                 data,                 # MjData
                 origin,               # ray origin
                 wdir,                 # ray direction (need not be unit; mj_ray normalises)
