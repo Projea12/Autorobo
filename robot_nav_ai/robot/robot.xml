@@ -103,6 +103,29 @@
       <!-- IMU site at chassis top-centre (used for gyro / accel / quat sensors) -->
       <site name="imu_site" pos="0 0 0.075" size="0.010" rgba="0.1 0.5 0.9 1"/>
 
+      <!--
+        LiDAR site — 2-D horizontal scan in the XY plane of this site.
+        Mounted 12 cm above chassis top so the beam clears the chassis edge.
+        Python raycasting uses site_xpos / site_xmat at each step.
+      -->
+      <site name="lidar_site" pos="0 0 0.120" size="0.012" rgba="1.0 0.5 0.0 1"/>
+
+      <!--
+        Front RGB-D camera — Intel RealSense D435 analogue.
+        Position : front face of chassis, 10 cm above chassis top.
+        xyaxes   : cam-X = body -Y (image right), cam-Y = body +Z (image up)
+                   → cam-Z (look dir) = cam-X × cam-Y = +X (robot forward).
+        fovy     : 58° vertical (D435 spec).
+        Resolution set at render time via mujoco.Renderer(h, w).
+      -->
+      <camera name="rgbd_cam"
+              pos="0.26 0 0.085"
+              xyaxes="0 -1 0  0 0 1"
+              fovy="58"/>
+
+      <!-- Corresponding visualisation site for the camera optical centre -->
+      <site name="rgbd_cam_site" pos="0.26 0 0.085" size="0.008" rgba="0.0 0.8 0.8 1"/>
+
       <!-- ── Left drive wheel ── -->
       <body name="wheel_left" pos="0 0.225 -0.05">
         <joint name="wheel_left_joint" type="hinge" axis="0 1 0" class="wheel"/>
@@ -218,6 +241,17 @@
                     <!-- Tool Centre Point: midpoint between closed fingertips -->
                     <site name="ee_site" pos="0.042 0 0" size="0.008"
                           rgba="0.15 0.75 0.15 1"/>
+
+                    <!--
+                      Wrist RGB camera — looks along arm +X toward the object.
+                      Mounted above gripper palm, 3 cm offset.
+                      xyaxes: cam-X = gripper -Y (image right), cam-Y = gripper +Z (up)
+                      fovy   : 69° vertical (wide angle for close-up grasping).
+                    -->
+                    <camera name="wrist_cam"
+                            pos="-0.01 0 0.030"
+                            xyaxes="0 -1 0  0 0 1"
+                            fovy="69"/>
                   </body>
                   <!-- ════════════════════════════════════════ -->
 
