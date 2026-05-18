@@ -143,11 +143,10 @@ def test_keyframe_exists(model, kf_name):
 
 
 def test_home_keyframe_qpos_length(model):
+    # MuJoCo 3: key_qpos is shape (nkey, nq), not a flat array
     kf_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, KF_HOME)
-    # Each keyframe stores a full qpos slice
-    start = kf_id * model.nq
-    end   = start + model.nq
-    assert end <= len(model.key_qpos)
+    assert model.key_qpos.shape == (model.nkey, model.nq)
+    assert model.key_qpos[kf_id].shape == (NQ,)
 
 
 # ── 10. Physics: no NaN after stepping from home pose ─────────────────────────
