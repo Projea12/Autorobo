@@ -272,21 +272,24 @@
        ACTUATORS  (nu = 9)
        ══════════════════════════════════════════════════════════════════════ -->
   <actuator>
-    <!-- Differential drive — velocity control (ctrl units: rad/s at wheel joint) -->
-    <!-- gear=8: output torque = kv × gear × velocity_error                       -->
-    <velocity name="drive_left"  joint="wheel_left_joint"  kv="25" gear="8"/>
-    <velocity name="drive_right" joint="wheel_right_joint" kv="25" gear="8"/>
+    <!-- Differential drive — velocity control (ctrl units: rad/s at wheel joint)  -->
+    <!-- ctrlrange ±8 rad/s → ±0.80 m/s linear, ±3.56 rad/s angular (wheelbase=0.45m) -->
+    <velocity name="drive_left"  joint="wheel_left_joint"  kv="25" gear="8"
+              ctrlrange="-8 8" forcerange="-40 40"/>
+    <velocity name="drive_right" joint="wheel_right_joint" kv="25" gear="8"
+              ctrlrange="-8 8" forcerange="-40 40"/>
 
-    <!-- Arm — position control; kp (stiffness) decreases toward the tip -->
-    <position name="arm_j1" joint="joint1" kp="400" ctrlrange="-3.14159 3.14159"/>
-    <position name="arm_j2" joint="joint2" kp="400" ctrlrange="-1.5708  3.14159"/>
-    <position name="arm_j3" joint="joint3" kp="250" ctrlrange="-3.14159 3.14159"/>
-    <position name="arm_j4" joint="joint4" kp="80"  ctrlrange="-3.14159 3.14159"/>
-    <position name="arm_j5" joint="joint5" kp="80"  ctrlrange="-3.14159 3.14159"/>
-    <position name="arm_j6" joint="joint6" kp="40"  ctrlrange="-3.14159 3.14159"/>
+    <!-- Arm — position control; kp decreases toward tip (lighter distal links)   -->
+    <!-- forcerange mirrors UR5 torque specs: 150/150/100/30/30/15 N·m             -->
+    <position name="arm_j1" joint="joint1" kp="400" ctrlrange="-3.14159 3.14159" forcerange="-150 150"/>
+    <position name="arm_j2" joint="joint2" kp="400" ctrlrange="-1.5708  3.14159" forcerange="-150 150"/>
+    <position name="arm_j3" joint="joint3" kp="250" ctrlrange="-3.14159 3.14159" forcerange="-100 100"/>
+    <position name="arm_j4" joint="joint4" kp="80"  ctrlrange="-3.14159 3.14159" forcerange="-30   30"/>
+    <position name="arm_j5" joint="joint5" kp="80"  ctrlrange="-3.14159 3.14159" forcerange="-30   30"/>
+    <position name="arm_j6" joint="joint6" kp="40"  ctrlrange="-3.14159 3.14159" forcerange="-15   15"/>
 
-    <!-- Gripper — one actuator drives left finger; equality couples right finger -->
-    <position name="gripper" joint="finger_left_joint" kp="300" ctrlrange="0 0.040"/>
+    <!-- Gripper — 50 N max fingertip force (≈ typical research gripper spec)     -->
+    <position name="gripper" joint="finger_left_joint" kp="300" ctrlrange="0 0.040" forcerange="-50 50"/>
   </actuator>
 
   <!-- ══════════════════════════════════════════════════════════════════════
