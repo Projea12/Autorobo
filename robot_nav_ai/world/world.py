@@ -30,6 +30,8 @@ import pybullet_data
 
 # ── Colour helpers ────────────────────────────────────────────────────────────
 _FLOOR_COLOUR    = [0.55, 0.55, 0.55, 1.0]
+_FLOOR_ALT_COLOUR = [0.45, 0.45, 0.45, 1.0]   # checker dark tile
+_GRID_COLOUR     = [0.25, 0.25, 0.25, 1.0]
 _WALL_COLOUR     = [0.30, 0.30, 0.35, 1.0]
 _BOX_COLOUR      = [0.70, 0.40, 0.10, 1.0]
 _CYLINDER_COLOUR = [0.20, 0.55, 0.20, 1.0]
@@ -48,11 +50,16 @@ class ObstacleConfig:
 @dataclass
 class WorldConfig:
     """Top-level arena configuration."""
-    arena_size:    float = 6.0    # half-extent → arena spans ±arena_size/2
-    wall_height:   float = 0.5
+    arena_size:     float = 6.0     # full side length — arena spans ±arena_size/2
+    wall_height:    float = 0.5
     wall_thickness: float = 0.05
-    num_obstacles:  int  = 10
+    num_obstacles:  int   = 10
     seed:           Optional[int] = None
+    # "plane" → infinite plane.urdf (fast, no boundary box needed)
+    # "box"   → explicit flat box sized to arena_size (visible edges, grid lines)
+    floor_type:     str   = "plane"
+    floor_thickness: float = 0.02   # only used when floor_type == "box"
+    grid_lines:     bool  = True    # draw 1 m grid on box floor (GUI only)
     # fixed obstacles — if empty, obstacles are randomly generated
     fixed_obstacles: List[ObstacleConfig] = field(default_factory=list)
 
@@ -170,10 +177,34 @@ class World:
         p.setGravity(0, 0, -9.81, physicsClientId=self._client)
 
     def _build_floor(self) -> None:
-        """Load PyBullet's built-in plane and tint it."""
+        """
+        Build the ground surface.
+
+        floor_type = "plane"
+            Loads PyBullet's built-in plane.urdf — infinite, zero-thickness,
+            no visual edges.  Fastest option; good for open-world training.
+
+        floor_type = "box"
+            Creates an explicit flat box sized exactly to arena_size × arena_size.
+            Shows a visible boundary edge and optional 1 m debug grid so the
+            agent can perceive its position relative to the arena.
+        """
+        if self._cfg.floor_type == "plane":
+            self._build_floor_plane()
+        elif self._cfg.floor_type == "box":
+            self._build_floor_box()
+        else:
+            raise ValueError(
+                f"Unknown floor_type {self._cfg.floor_type!r}. "
+                "Choose 'plane' or 'box'."
+            )
+
+    def _build_floor_plane(self) -> None:
+        """Infinite ground plane from PyBullet's built-in plane.urdf."""
         self._floor_id = p.loadURDF(
             "plane.urdf",
             basePosition=[0, 0, 0],
+            useFixedBase=True,
             physicsClientId=self._client,
         )
         p.changeVisualShape(
@@ -181,6 +212,88 @@ class World:
             rgbaColor=_FLOOR_COLOUR,
             physicsClientId=self._client,
         )
+
+    def _build_floor_box(self) -> None:
+        """
+        Explicit flat box floor bounded to the arena footprint.
+
+        Geometry
+        --------
+        S  = arena_size          (e.g. 6.0 m)
+        T  = floor_thickness     (e.g. 0.02 m)
+        Top surface sits at z = 0 (world origin).
+        Box centre is therefore at z = −T/2.
+
+        The collision shape is a single box so PyBullet's broadphase
+        handles it in O(1) regardless of arena size.
+        """
+        S = self._cfg.arena_size
+        T = self._cfg.floor_thickness
+
+        col_id = p.createCollisionShape(
+            p.GEOM_BOX,
+            halfExtents=[S / 2, S / 2, T / 2],
+            physicsClientId=self._client,
+        )
+        vis_id = p.createVisualShape(
+            p.GEOM_BOX,
+            halfExtents=[S / 2, S / 2, T / 2],
+            rgbaColor=_FLOOR_COLOUR,
+            physicsClientId=self._client,
+        )
+        self._floor_id = p.createMultiBody(
+            baseMass=0,                         # static — never moves
+            baseCollisionShapeIndex=col_id,
+            baseVisualShapeIndex=vis_id,
+            basePosition=[0, 0, -T / 2],        # top face flush with z = 0
+            physicsClientId=self._client,
+        )
+
+        # ── border edge lines ────────────────────────────────────────────────
+        # Draw the four top edges so the boundary is clearly visible in GUI.
+        h = S / 2
+        corners = [(-h, -h, 0), (h, -h, 0), (h, h, 0), (-h, h, 0)]
+        for i in range(4):
+            p.addUserDebugLine(
+                corners[i], corners[(i + 1) % 4],
+                lineColorRGB=[0.1, 0.1, 0.1],
+                lineWidth=2,
+                physicsClientId=self._client,
+            )
+
+        # ── 1 m grid lines ───────────────────────────────────────────────────
+        if self._cfg.grid_lines:
+            self._draw_grid(S)
+
+    def _draw_grid(self, arena_size: float, cell: float = 1.0) -> None:
+        """
+        Draw a debug grid of cell × cell metre squares on the floor.
+
+        Lines run from -arena_size/2 to +arena_size/2 in both axes,
+        spaced `cell` metres apart.  Skips the centre lines (already clear).
+        """
+        half  = arena_size / 2.0
+        steps = int(arena_size / cell) + 1
+        z     = 0.002   # just above floor surface to avoid z-fighting
+
+        for i in range(steps):
+            offset = -half + i * cell
+            if abs(offset) > half:
+                continue
+            # parallel to X axis
+            p.addUserDebugLine(
+                [-half, offset, z], [half, offset, z],
+                lineColorRGB=_GRID_COLOUR[:3],
+                lineWidth=1,
+                physicsClientId=self._client,
+            )
+            # parallel to Y axis
+            p.addUserDebugLine(
+                [offset, -half, z], [offset, half, z],
+                lineColorRGB=_GRID_COLOUR[:3],
+                lineWidth=1,
+                physicsClientId=self._client,
+            )
 
     def _build_walls(self) -> None:
         """
