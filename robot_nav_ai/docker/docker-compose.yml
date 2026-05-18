@@ -1,0 +1,114 @@
+version: "3.9"
+
+# AutoRobo Physical AI — Docker Compose Services
+#
+# Services:
+#   training   — PPO navigation training
+#   grasping   — SAC grasp policy training
+#   evaluation — Full evaluation suite
+#   jupyter    — Jupyter Lab for analysis
+#
+# Usage:
+#   docker compose up training
+#   docker compose up jupyter
+#   docker compose run --rm evaluation python scripts/evaluate.py
+#   docker compose up --scale training=4  # 4 parallel training runs
+
+x-common-env: &common-env
+  MUJOCO_GL: egl
+  PYTHONUNBUFFERED: "1"
+  WANDB_API_KEY: ${WANDB_API_KEY:-}
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+
+x-common-volumes: &common-volumes
+  - ./logs:/app/logs
+  - ./models:/app/models
+  - ./data:/app/data
+  - ./configs:/app/configs
+
+services:
+
+  # ── Navigation Training (PPO) ─────────────────────────────
+  training:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: training
+    image: autorobo:training
+    container_name: autorobo_training_nav
+    environment:
+      <<: *common-env
+    volumes: *common-volumes
+    command: python scripts/train_nav.py
+    deploy:
+      resources:
+        limits:
+          memory: 16G
+        reservations:
+          memory: 8G
+    restart: on-failure:3
+
+  # ── Grasp Policy Training (SAC) ───────────────────────────
+  grasping:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: training
+    image: autorobo:training
+    container_name: autorobo_training_grasp
+    environment:
+      <<: *common-env
+    volumes: *common-volumes
+    command: python scripts/train_grasp.py training=sac
+    deploy:
+      resources:
+        limits:
+          memory: 24G
+        reservations:
+          memory: 12G
+    restart: on-failure:3
+
+  # ── Evaluation Suite ──────────────────────────────────────
+  evaluation:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: training
+    image: autorobo:training
+    container_name: autorobo_evaluation
+    environment:
+      <<: *common-env
+    volumes: *common-volumes
+    command: python scripts/evaluate.py
+    restart: "no"
+
+  # ── Jupyter Lab ───────────────────────────────────────────
+  jupyter:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: jupyter
+    image: autorobo:jupyter
+    container_name: autorobo_jupyter
+    environment:
+      <<: *common-env
+    volumes:
+      - ./logs:/app/logs
+      - ./models:/app/models
+      - ./data:/app/data
+      - ./notebooks:/app/notebooks
+      - ./configs:/app/configs
+    ports:
+      - "8888:8888"
+    restart: unless-stopped
+
+  # ── TensorBoard ───────────────────────────────────────────
+  tensorboard:
+    image: tensorflow/tensorflow:latest-jupyter
+    container_name: autorobo_tensorboard
+    volumes:
+      - ./logs:/logs
+    ports:
+      - "6006:6006"
+    command: tensorboard --logdir=/logs --host=0.0.0.0 --port=6006
+    restart: unless-stopped

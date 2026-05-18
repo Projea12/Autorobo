@@ -1,0 +1,80 @@
+# AutoRobo .dockerignore
+# Excludes files/dirs that should NOT be copied into the Docker build context.
+# Keeping the context small speeds up docker build significantly.
+
+# ── Virtual environments ──────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+.env/
+
+# ── Python cache ─────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+
+# ── Build artefacts ──────────────────────────────────────────
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+wheels/
+
+# ── Training outputs (mounted as volumes at runtime) ──────────
+logs/
+models/
+data/
+outputs/
+multirun/
+
+# ── Jupyter checkpoints ──────────────────────────────────────
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/
+
+# ── Version control ───────────────────────────────────────────
+.git/
+.gitignore
+.gitattributes
+
+# ── IDE / editor files ────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Testing and coverage ──────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# ── Documentation source (not needed in container) ────────────
+docs/
+*.md
+
+# ── Type checking ─────────────────────────────────────────────
+.mypy_cache/
+.ruff_cache/
+
+# ── Large binary assets (download at runtime if needed) ───────
+assets/robots/*.stl
+assets/robots/*.obj
+*.pt
+*.pth
+*.onnx
+*.trt
+
+# ── Secrets / environment files ───────────────────────────────
+.env
+.env.*
+secrets/
+*.pem
+*.key
