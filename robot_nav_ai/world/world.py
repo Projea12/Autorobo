@@ -33,6 +33,7 @@ _FLOOR_COLOUR    = [0.55, 0.55, 0.55, 1.0]
 _FLOOR_ALT_COLOUR = [0.45, 0.45, 0.45, 1.0]   # checker dark tile
 _GRID_COLOUR     = [0.25, 0.25, 0.25, 1.0]
 _WALL_COLOUR     = [0.30, 0.30, 0.35, 1.0]
+_WALL_STRIPE     = [0.80, 0.80, 0.10, 1.0]   # yellow warning stripe near top
 _BOX_COLOUR      = [0.70, 0.40, 0.10, 1.0]
 _CYLINDER_COLOUR = [0.20, 0.55, 0.20, 1.0]
 _GOAL_COLOUR     = [0.00, 0.85, 0.20, 0.6]
@@ -94,10 +95,11 @@ class World:
         self._rng = random.Random(self._cfg.seed)
 
         # body-id registries
-        self._floor_id:     Optional[int] = None
-        self._wall_ids:     List[int]     = []
-        self._obstacle_ids: List[int]     = []
-        self._goal_id:      Optional[int] = None
+        self._floor_id:      Optional[int]       = None
+        self._wall_ids:      List[int]            = []
+        self._named_wall_ids: dict                = {}   # {"north": id, ...}
+        self._obstacle_ids:  List[int]            = []
+        self._goal_id:       Optional[int]        = None
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -123,10 +125,11 @@ class World:
                     p.removeBody(body_id, physicsClientId=self._client)
                 except Exception:
                     pass
-        self._floor_id     = None
-        self._wall_ids     = []
-        self._obstacle_ids = []
-        self._goal_id      = None
+        self._floor_id       = None
+        self._wall_ids       = []
+        self._named_wall_ids = {}
+        self._obstacle_ids   = []
+        self._goal_id        = None
 
     def sample_goal(
         self,
@@ -163,6 +166,13 @@ class World:
     @property
     def wall_ids(self) -> List[int]:
         return list(self._wall_ids)
+
+    def wall_id(self, face: str) -> int:
+        """Return body id for a named wall: 'north','south','east','west'."""
+        try:
+            return self._named_wall_ids[face]
+        except KeyError:
+            raise KeyError(f"No wall named {face!r}. Choose from {list(self._named_wall_ids)}")
 
     @property
     def all_obstacle_ids(self) -> List[int]:
@@ -297,40 +307,110 @@ class World:
 
     def _build_walls(self) -> None:
         """
-        Four axis-aligned walls that form a closed square boundary.
+        Four solid boundary walls built with explicit PyBullet primitives.
 
-        Wall layout (top-down view, arena_size = S):
-                        North  (y = +S/2)
-              ┌──────────────────────────┐
-         West │                          │ East
-         (-S/2│                          │+S/2)
-              └──────────────────────────┘
-                        South  (y = -S/2)
+        Top-down layout (arena_size = S, wall_thickness = T):
+        ┌─────────────────────────────────────────┐  y = +S/2  NORTH
+        │◄──── S + 2T ────────────────────────────►│
+        │                                         │
+        │                 arena                   │  x = ±S/2
+        │                                         │
+        └─────────────────────────────────────────┘  y = −S/2  SOUTH
+
+        Corner strategy — N/S walls span the full width INCLUDING the corner
+        blocks (half_x = S/2 + T) so E/W walls slot flush inside them:
+
+            ┌──┬──────────────────────────┬──┐  ← North wall (full width)
+            │  │                          │  │
+            │W │         arena            │E │  ← East/West (inner length only)
+            │  │                          │  │
+            └──┴──────────────────────────┴──┘  ← South wall (full width)
+
+        Each wall is created with:
+          1. p.createCollisionShape  — solid box the physics engine resolves
+          2. p.createVisualShape     — rendered geometry (same box, tinted)
+          3. p.createMultiBody       — combines both into a zero-mass static body
+          4. p.createCollisionShape  — thin stripe for the yellow warning band
+          5. A debug text label      — face name visible in GUI
         """
-        S  = self._cfg.arena_size
-        H  = self._cfg.wall_height
-        T  = self._cfg.wall_thickness
+        S = self._cfg.arena_size
+        H = self._cfg.wall_height
+        T = self._cfg.wall_thickness
 
-        # (cx, cy, cz,  half_lx, half_ly, half_lz)
-        wall_specs = [
-            # North
-            ( 0,  S / 2, H / 2,   S / 2 + T,  T / 2,  H / 2),
-            # South
-            ( 0, -S / 2, H / 2,   S / 2 + T,  T / 2,  H / 2),
-            # East
-            ( S / 2, 0,  H / 2,   T / 2,  S / 2,  H / 2),
-            # West
-            (-S / 2, 0,  H / 2,   T / 2,  S / 2,  H / 2),
-        ]
+        # ── wall geometry table ───────────────────────────────────────────────
+        # name, centre (cx,cy,cz), half-extents (hx,hy,hz)
+        #
+        # N/S walls: hx = S/2+T  so they fill the corner blocks
+        # E/W walls: hy = S/2    so they fit exactly between the corners
+        wall_table = {
+            "north": ((  0,       S/2, H/2), (S/2+T, T/2,  H/2)),
+            "south": ((  0,      -S/2, H/2), (S/2+T, T/2,  H/2)),
+            "east":  (( S/2,       0,  H/2), (T/2,   S/2,  H/2)),
+            "west":  ((-S/2,       0,  H/2), (T/2,   S/2,  H/2)),
+        }
 
-        for cx, cy, cz, hx, hy, hz in wall_specs:
-            body_id = self._make_box(
-                half_extents=(hx, hy, hz),
-                position=(cx, cy, cz),
-                colour=_WALL_COLOUR,
-                mass=0,          # static
+        for face, (centre, half_ext) in wall_table.items():
+            cx, cy, cz = centre
+            hx, hy, hz = half_ext
+
+            # ── 1. collision shape ────────────────────────────────────────────
+            col_id = p.createCollisionShape(
+                p.GEOM_BOX,
+                halfExtents=[hx, hy, hz],
+                physicsClientId=self._client,
             )
+
+            # ── 2. visual shape (main body) ───────────────────────────────────
+            vis_id = p.createVisualShape(
+                p.GEOM_BOX,
+                halfExtents=[hx, hy, hz],
+                rgbaColor=_WALL_COLOUR,
+                physicsClientId=self._client,
+            )
+
+            # ── 3. static rigid body ──────────────────────────────────────────
+            #   baseMass = 0  →  immovable; robot cannot push it
+            body_id = p.createMultiBody(
+                baseMass=0,
+                baseCollisionShapeIndex=col_id,
+                baseVisualShapeIndex=vis_id,
+                basePosition=[cx, cy, cz],
+                baseOrientation=[0, 0, 0, 1],
+                physicsClientId=self._client,
+            )
+
+            # ── 4. warning stripe (visual-only, no collision) ─────────────────
+            # A thin yellow band near the top of each wall — helps the agent
+            # and the human viewer quickly spot the boundary.
+            stripe_h  = min(0.06, hz * 0.25)           # 6 cm or 25 % of height
+            stripe_z  = cz + hz - stripe_h             # flush with wall top
+            stripe_vis = p.createVisualShape(
+                p.GEOM_BOX,
+                halfExtents=[hx, hy + 0.001, stripe_h],  # 1 mm proud of wall
+                rgbaColor=_WALL_STRIPE,
+                physicsClientId=self._client,
+            )
+            p.createMultiBody(
+                baseMass=0,
+                baseCollisionShapeIndex=-1,             # no collision — visual only
+                baseVisualShapeIndex=stripe_vis,
+                basePosition=[cx, cy, stripe_z],
+                physicsClientId=self._client,
+            )
+
+            # ── 5. GUI label ──────────────────────────────────────────────────
+            label_pos = [cx, cy, cz + hz + 0.08]
+            p.addUserDebugText(
+                face.upper(),
+                label_pos,
+                textColorRGB=[1, 1, 1],
+                textSize=0.9,
+                physicsClientId=self._client,
+            )
+
+            # register
             self._wall_ids.append(body_id)
+            self._named_wall_ids[face] = body_id
 
     def _build_obstacles(self) -> None:
         if self._cfg.fixed_obstacles:
