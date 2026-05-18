@@ -23,6 +23,7 @@ def run_episode(root_seed: int, n_steps: int = 10):
     cfg = set_global_seed(root_seed)
     env = RobotNavEnv()
     obs, _ = env.reset(seed=cfg.env_seed)
+    env.action_space.seed(cfg.env_seed)      # action_space has its own RNG
 
     obs_seq, reward_seq = [obs.copy()], []
     for _ in range(n_steps):
@@ -103,15 +104,15 @@ def test_torch_reproducible():
 # ── full episode reproducibility ──────────────────────────────────────────────
 
 def test_same_seed_gives_identical_episode():
-    obs_a, rew_a = run_episode(seed=42)
-    obs_b, rew_b = run_episode(seed=42)
+    obs_a, rew_a = run_episode(root_seed=42)
+    obs_b, rew_b = run_episode(root_seed=42)
     np.testing.assert_array_equal(obs_a, obs_b)
     np.testing.assert_array_equal(rew_a, rew_b)
 
 
 def test_different_seeds_give_different_episodes():
-    obs_a, _ = run_episode(seed=42)
-    obs_b, _ = run_episode(seed=99)
+    obs_a, _ = run_episode(root_seed=42)
+    obs_b, _ = run_episode(root_seed=99)
     assert not np.array_equal(obs_a, obs_b)
 
 

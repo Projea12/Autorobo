@@ -48,6 +48,7 @@ def set_global_seed(seed: int) -> SeedConfig:
     -------
     >>> cfg = set_global_seed(42)
     >>> obs, _ = env.reset(seed=cfg.env_seed)
+    >>> env.action_space.seed(cfg.env_seed)   # action_space has its own RNG
     """
     cfg = SeedConfig(root=seed)
 
