@@ -1,0 +1,71 @@
+# MuJoCo Environment Configuration
+# Hydra config for the simulation environment
+
+env:
+  name: "MobileManipulationEnv-v0"
+  backend: "mujoco"            # options: mujoco, mujoco_mjx (GPU)
+
+  # MuJoCo sim settings
+  mujoco:
+    scene_xml: "assets/scenes/tabletop_scene.xml"
+    timestep: 0.002            # seconds (500 Hz physics)
+    control_timestep: 0.02     # seconds (50 Hz control)
+    n_substeps: 10             # physics steps per control step
+    gravity: [0.0, 0.0, -9.81]
+    use_gpu: false             # set true for MJX backend
+
+  # Episode settings
+  episode:
+    max_steps: 1000
+    success_threshold: 0.05    # metres — goal position tolerance
+    reset_on_success: true
+    randomise_objects: true
+    randomise_lighting: false
+
+  # Objects to place in scene
+  objects:
+    dataset: "ycb"             # YCB object dataset
+    num_objects: 3
+    object_ids:
+      - "003_cracker_box"
+      - "005_tomato_soup_can"
+      - "011_banana"
+    spawn_area:
+      x: [0.3, 0.7]
+      y: [-0.3, 0.3]
+      z: [0.76, 0.76]          # table height
+
+  # Table
+  table:
+    height: 0.75               # metres from floor
+    dimensions: [1.0, 0.8]    # length x width
+
+  # Navigation goal settings
+  navigation:
+    goal_radius: 0.3           # metres around goal
+    obstacle_density: 0.1      # fraction of floor area occluded
+
+  # Reward shaping (used in training, can override per-algo config)
+  reward:
+    navigation_success: 10.0
+    grasp_success: 20.0
+    place_success: 30.0
+    collision_penalty: -1.0
+    step_penalty: -0.01
+    distance_shaping: true
+    shaping_scale: 1.0
+
+  # Observation space components
+  observation:
+    include_rgb: true
+    include_depth: true
+    include_lidar: true
+    include_proprioception: true
+    image_size: [84, 84]       # resize for RL training
+
+  # Rendering
+  render:
+    mode: "rgb_array"          # options: human, rgb_array, depth_array
+    camera_name: "top_down"
+    width: 640
+    height: 480

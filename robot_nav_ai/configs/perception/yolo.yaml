@@ -1,0 +1,65 @@
+# Perception Configuration — YOLOv8 Object Detector
+# Used by the perception stack for real-time object detection
+
+perception:
+  detector:
+    backend: "yolov8"
+    model_size: "n"            # options: n (nano), s, m, l, x
+    model_path: "models/perception/yolov8n.pt"
+    pretrained: true           # load COCO pretrained weights
+    fine_tuned: false          # set true after fine-tuning on YCB
+    fine_tuned_path: "models/perception/yolov8_ycb.pt"
+
+    # Inference settings
+    confidence_threshold: 0.5
+    iou_threshold: 0.45        # NMS IoU threshold
+    max_detections: 20
+    input_size: [640, 640]     # model input resolution
+    device: "cpu"              # options: cpu, cuda:0, mps
+
+    # Classes to detect (YCB objects)
+    classes:
+      - "cracker_box"
+      - "tomato_soup_can"
+      - "banana"
+      - "pitcher_base"
+      - "bleach_cleanser"
+      - "bowl"
+      - "mug"
+      - "drill"
+      - "scissors"
+
+  segmenter:
+    backend: "sam2"            # Segment Anything Model 2
+    model_type: "vit_h"        # options: vit_b, vit_l, vit_h
+    checkpoint: "models/perception/sam2_hiera_large.pt"
+    device: "cpu"
+    # Prompting mode: box (from YOLO detections) or points
+    prompt_mode: "box"
+
+  depth:
+    backend: "depth_anything_v2"
+    model_size: "small"        # options: small, base, large
+    checkpoint: "models/perception/depth_anything_v2_vits.pth"
+    device: "cpu"
+    output_size: [518, 518]    # model native input size
+    min_depth: 0.1             # metres
+    max_depth: 10.0            # metres
+    metric_depth: true         # use metric (not relative) depth
+
+  # Camera calibration
+  camera:
+    fx: 525.0                  # focal length x
+    fy: 525.0                  # focal length y
+    cx: 319.5                  # principal point x
+    cy: 239.5                  # principal point y
+    width: 640
+    height: 480
+    distortion_coeffs: [0.0, 0.0, 0.0, 0.0, 0.0]
+
+  # Grasp pose estimation
+  grasp_estimator:
+    method: "anygrasp"         # options: anygrasp, graspnet, heuristic
+    num_grasp_candidates: 10
+    min_grasp_quality: 0.5
+    grasp_width_range: [0.02, 0.085]  # metres

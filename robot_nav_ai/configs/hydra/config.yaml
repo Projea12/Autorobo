@@ -1,0 +1,32 @@
+# Top-Level Hydra Composition Config
+# This is the main entry point for all Hydra configurations.
+# Override any group config from the command line, e.g.:
+#   python scripts/train_nav.py training=ppo env=mujoco robot=base
+
+defaults:
+  - robot: base
+  - env: mujoco
+  - training: ppo
+  - perception: yolo
+  - _self_
+
+# Global project settings
+project:
+  name: "autorobo_physical_ai"
+  version: "0.1.0"
+  phase: 3                     # current development phase (1-17)
+  log_dir: "logs/"
+  model_dir: "models/"
+  data_dir: "data/"
+  seed: 42
+
+# Hydra output settings
+hydra:
+  run:
+    dir: "outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}"
+  sweep:
+    dir: "multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}"
+    subdir: "${hydra.job.num}"
+  job:
+    chdir: true
+  verbose: false

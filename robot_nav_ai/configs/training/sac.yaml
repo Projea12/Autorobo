@@ -1,0 +1,63 @@
+# SAC Hyperparameters — Grasp Policy
+# Used in Phase 8: training the arm grasp agent with SAC
+
+training:
+  algorithm: "SAC"
+  total_timesteps: 2_000_000
+  seed: 42
+
+  # SAC-specific hyperparameters
+  sac:
+    learning_rate: 3.0e-4
+    lr_schedule: "constant"
+    buffer_size: 1_000_000     # replay buffer capacity
+    learning_starts: 10_000    # random exploration steps before training
+    batch_size: 256
+    tau: 0.005                 # soft target update coefficient
+    gamma: 0.99
+    train_freq: 1              # update every N steps
+    gradient_steps: 1          # gradient updates per env step
+    action_noise: null         # SAC uses stochastic policy
+    optimize_memory_usage: false
+    ent_coef: "auto"           # auto-tune entropy coefficient
+    target_update_interval: 1
+    target_entropy: "auto"     # -dim(action_space)
+    use_sde: false
+    sde_sample_freq: -1
+    use_sde_at_warmup: false
+
+  # Parallel environments (SAC works well with 1 env + large buffer)
+  n_envs: 1
+  vec_env_type: "dummy"
+
+  # Network architecture
+  policy:
+    type: "MultiInputPolicy"
+    net_arch: [256, 256]
+    activation_fn: "relu"
+
+  # CNN encoder for image observations
+  features_extractor:
+    type: "NatureCNN"
+    features_dim: 256
+
+  # Checkpointing
+  checkpoint:
+    save_freq: 20_000
+    save_path: "models/grasping/sac/"
+    name_prefix: "sac_grasp"
+    keep_n_checkpoints: 5
+
+  # Logging
+  logging:
+    log_interval: 4            # log every N updates
+    tensorboard_log: "logs/grasping/sac/"
+    wandb_project: "autorobo-grasping"
+    wandb_run_name: "sac_grasp_v1"
+
+  # Evaluation during training
+  eval:
+    eval_freq: 50_000
+    n_eval_episodes: 20
+    deterministic: true
+    eval_env: "GraspingEnv-v0"

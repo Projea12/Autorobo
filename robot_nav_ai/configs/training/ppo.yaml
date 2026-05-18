@@ -1,0 +1,63 @@
+# PPO Hyperparameters — Navigation Policy
+# Used in Phase 3: training the mobile base navigation agent
+
+training:
+  algorithm: "PPO"
+  total_timesteps: 5_000_000
+  seed: 42
+
+  # PPO-specific hyperparameters
+  ppo:
+    learning_rate: 3.0e-4
+    lr_schedule: "linear"       # linear decay to 0 over training
+    n_steps: 2048               # steps per rollout per env
+    batch_size: 64
+    n_epochs: 10                # gradient update epochs per rollout
+    gamma: 0.99                 # discount factor
+    gae_lambda: 0.95            # GAE lambda
+    clip_range: 0.2
+    clip_range_vf: null         # null = no value function clipping
+    normalize_advantage: true
+    ent_coef: 0.01              # entropy bonus coefficient
+    vf_coef: 0.5                # value function loss coefficient
+    max_grad_norm: 0.5
+    use_sde: false              # state-dependent exploration
+    sde_sample_freq: -1
+
+  # Parallel environments
+  n_envs: 8
+  vec_env_type: "subproc"      # options: subproc, dummy
+
+  # Network architecture
+  policy:
+    type: "MultiInputPolicy"   # handles dict obs (rgb + lidar + proprioception)
+    net_arch:
+      pi: [256, 256]           # policy network hidden layers
+      vf: [256, 256]           # value network hidden layers
+    activation_fn: "relu"
+    ortho_init: true
+
+  # CNN encoder for image observations
+  features_extractor:
+    type: "NatureCNN"
+    features_dim: 512
+
+  # Checkpointing
+  checkpoint:
+    save_freq: 50_000           # steps between saves
+    save_path: "models/navigation/ppo/"
+    name_prefix: "ppo_nav"
+    keep_n_checkpoints: 5
+
+  # Logging
+  logging:
+    log_interval: 10            # log every N updates
+    tensorboard_log: "logs/navigation/ppo/"
+    wandb_project: "autorobo-navigation"
+    wandb_run_name: "ppo_nav_v1"
+
+  # Evaluation during training
+  eval:
+    eval_freq: 100_000          # eval every N steps
+    n_eval_episodes: 20
+    deterministic: true
