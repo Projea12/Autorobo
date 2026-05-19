@@ -202,7 +202,7 @@ class GraspGoalSelector:
             object_pos[:2], np.asarray(robot_pos[:2])
         )
         for c in candidates:
-            c.score    = self._score(c, object_pos, raw_dists)
+            c.score    = self._score(c, object_pos, raw_dists, lidar_range)
             c.feasible = self._is_feasible(c, raw_dists, lidar_range)
 
         feasible = [c for c in candidates if c.feasible]
@@ -245,7 +245,7 @@ class GraspGoalSelector:
             object_pos[:2], np.asarray(robot_pos[:2])
         )
         for c in candidates:
-            c.score    = self._score(c, object_pos, raw_dists)
+            c.score    = self._score(c, object_pos, raw_dists, lidar_range)
             c.feasible = self._is_feasible(c, raw_dists, lidar_range)
         return candidates
 
@@ -313,9 +313,10 @@ class GraspGoalSelector:
 
     def _score(
         self,
-        c:          GraspCandidate,
-        object_pos: np.ndarray,
-        raw_dists:  np.ndarray,
+        c:           GraspCandidate,
+        object_pos:  np.ndarray,
+        raw_dists:   np.ndarray,
+        lidar_range: float = 5.0,
     ) -> float:
         """Weighted composite score for one candidate (higher = better)."""
         cfg = self._cfg
@@ -326,12 +327,9 @@ class GraspGoalSelector:
         half  = (ws.arm_reach_max - ws.arm_reach_min) / 2.0 + 1e-9
         s_reach = max(0.0, 1.0 - abs(c.dist_to_obj - mid) / half)
 
-        # b) Clearance: normalised min lidar distance (1 = far from obstacles)
-        n_rays  = len(raw_dists)
-        ray_angles = np.deg2rad(np.arange(n_rays) * (360.0 / n_rays))
-        min_d   = float(np.min(raw_dists))
-        lidar_max = float(np.max(raw_dists)) if len(raw_dists) > 0 else 5.0
-        s_clear = float(np.clip(min_d / max(lidar_max, 1e-9), 0.0, 1.0))
+        # b) Clearance: min lidar distance normalised by the sensor's max range
+        min_d   = float(np.min(raw_dists)) if len(raw_dists) > 0 else lidar_range
+        s_clear = float(np.clip(min_d / max(lidar_range, 1e-9), 0.0, 1.0))
 
         # c) Approach corridor: penalise if any obstacle is along the line
         #    from candidate to object (crude check via object distance)
