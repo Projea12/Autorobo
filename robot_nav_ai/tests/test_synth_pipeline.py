@@ -158,19 +158,19 @@ def test_pipeline_runs(tmp_path):
 
 
 def test_pipeline_creates_train_images(tmp_path):
-    cfg  = _small_cfg(tmp_path, n=10)
-    SynthPipeline(cfg).generate()
-    out = Path(cfg.out_dir)
+    cfg   = _small_cfg(tmp_path, n=10)
+    stats = SynthPipeline(cfg).generate()
+    out   = Path(cfg.out_dir)
     images = list((out / "images" / "train").iterdir())
-    assert len(images) == 8   # 80% of 10
+    assert len(images) == stats.n_train
 
 
 def test_pipeline_creates_val_images(tmp_path):
-    cfg  = _small_cfg(tmp_path, n=10)
-    SynthPipeline(cfg).generate()
-    out = Path(cfg.out_dir)
+    cfg   = _small_cfg(tmp_path, n=10)
+    stats = SynthPipeline(cfg).generate()
+    out   = Path(cfg.out_dir)
     images = list((out / "images" / "val").iterdir())
-    assert len(images) == 2
+    assert len(images) == stats.n_val
 
 
 def test_pipeline_creates_label_files(tmp_path):
@@ -238,7 +238,7 @@ def test_pipeline_manifest_n_images(tmp_path):
 def test_pipeline_stats_counts(tmp_path):
     cfg   = _small_cfg(tmp_path, n=8)
     stats = SynthPipeline(cfg).generate()
-    assert stats.n_train + stats.n_val == 8
+    assert stats.n_train + stats.n_val + stats.n_test == 8
 
 
 def test_pipeline_stats_elapsed_positive(tmp_path):
