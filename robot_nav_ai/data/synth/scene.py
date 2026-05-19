@@ -173,7 +173,7 @@ class SynthScene:
         sun.name      = "sun"
         sun.pos       = np.array([0.0, 0.0, 3.0])
         sun.dir       = np.array([0.0, -0.3, -1.0])
-        sun.directional = True
+        sun.type      = mujoco.mjtLightType.mjLIGHT_DIRECTIONAL
         sun.diffuse   = np.array([0.7, 0.7, 0.7])
         sun.specular  = np.array([0.2, 0.2, 0.2])
         sun.castshadow = True
