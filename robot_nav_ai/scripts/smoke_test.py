@@ -53,9 +53,12 @@ def _info(msg): print(f"  {_YELLOW}·{_RESET}  {msg}")
 
 # ── individual checks ─────────────────────────────────────────────────────────
 
+_ROBOT_XML = _ROOT / "robot" / "robot.xml"
+
+
 def check_mjcf_loads(verbose: bool) -> bool:
     import mujoco
-    mjcf = _ROOT / "robot" / "autorobo.xml"
+    mjcf = _ROBOT_XML
     if not mjcf.exists():
         _fail(f"MJCF not found: {mjcf}")
         return False
@@ -155,17 +158,14 @@ def check_physics_200_steps(verbose: bool) -> bool:
 
 def check_episode_reset(verbose: bool) -> bool:
     import mujoco
-    from env import ManipulationEnv
     from env.episode_reset import EpisodeResetter, SpawnConfig, GoalConfig
     from world.world import WorldBuilder, WorldConfig
 
     try:
         cfg        = WorldConfig()
         builder    = WorldBuilder(cfg)
-        spec       = builder.build()
-        model, _   = spec.compile()
+        model, ws  = builder.build(str(_ROBOT_XML))
         data       = mujoco.MjData(model)
-        ws         = builder.state(model)
 
         kf_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
         if kf_id < 0:
@@ -210,12 +210,10 @@ def check_obstacles(verbose: bool) -> bool:
     from world.world import WorldBuilder, WorldConfig
 
     try:
-        cfg      = WorldConfig(n_obstacles=4)
-        builder  = WorldBuilder(cfg)
-        spec     = builder.build()
-        model, _ = spec.compile()
-        data     = mujoco.MjData(model)
-        ws       = builder.state(model)
+        cfg       = WorldConfig(n_obstacles=4)
+        builder   = WorldBuilder(cfg)
+        model, ws = builder.build(str(_ROBOT_XML))
+        data      = mujoco.MjData(model)
 
         kf_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
         if kf_id < 0:
@@ -259,11 +257,10 @@ def check_domain_rand(verbose: bool) -> bool:
     from world.world import WorldBuilder, WorldConfig
 
     try:
-        cfg      = WorldConfig()
-        builder  = WorldBuilder(cfg)
-        spec     = builder.build()
-        model, _ = spec.compile()
-        data     = mujoco.MjData(model)
+        cfg       = WorldConfig()
+        builder   = WorldBuilder(cfg)
+        model, _  = builder.build(str(_ROBOT_XML))
+        data      = mujoco.MjData(model)
         mujoco.mj_forward(model, data)
 
         dr = DomainRandomizer(model)
