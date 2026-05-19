@@ -63,7 +63,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Tuple
 
 import mujoco
 import numpy as np
@@ -142,6 +142,7 @@ class NavObsConfig:
     ang_vel_max:     float = ANG_VEL_MAX
     grid_size_m:     float = GRID_SIZE_M
     robot_body_name: str   = "base_link"
+    geomgroup_mask:  Optional[tuple[int, ...]] = None   # None = all groups
 
     @property
     def obs_dim(self) -> int:
@@ -334,6 +335,8 @@ class NavObsBuilder:
         dists  = np.full(cfg.n_rays, cfg.lidar_max_range, dtype=np.float64)
         angles = np.deg2rad(cfg.ray_angles_deg)
         geomid = np.array([-1], dtype=np.int32)
+        ggroup = (np.array(cfg.geomgroup_mask, dtype=np.uint8)
+                  if cfg.geomgroup_mask is not None else None)
 
         for i, (bx, by, _) in enumerate(self._ray_body):
             # rotate body-frame ray direction to world frame
@@ -342,8 +345,8 @@ class NavObsBuilder:
             dist   = mujoco.mj_ray(
                 self.model, data,
                 pnt, vec,
-                None, 1,                         # all geom groups, include statics
-                self._robot_body_id,             # exclude robot body
+                ggroup, 1,                       # geomgroup filter, include statics
+                self._robot_body_id,             # additionally exclude robot body
                 geomid,
             )
             if dist >= 0 and dist < cfg.lidar_max_range:
