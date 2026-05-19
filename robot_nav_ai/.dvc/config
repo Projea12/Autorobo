@@ -1,2 +1,5 @@
 [core]
     no_scm = True
+    remote = local_store
+['remote "local_store"']
+    url = /tmp/autorobo_dvc_store
