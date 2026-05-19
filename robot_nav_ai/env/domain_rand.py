@@ -195,7 +195,7 @@ class DomainRandomizer:
         Parameters
         ----------
         model : MjModel to mutate (same instance as passed to __init__)
-        data  : MjData needed by mj_setConst()
+        data  : MjData — unused after the mj_setConst fix but kept for API stability
         rng   : NumPy Generator (caller controls seed for reproducibility)
         """
         cfg = self._cfg
@@ -228,7 +228,11 @@ class DomainRandomizer:
             self._rand_joint_damping(model, rng)
 
         if need_set_const:
-            mujoco.mj_setConst(model, data)
+            # mj_setConst resets the supplied data's qpos to model.qpos0,
+            # which would wipe any keyframe / spawn values already written.
+            # Use a throwaway MjData so the caller's data is untouched.
+            _tmp = mujoco.MjData(model)
+            mujoco.mj_setConst(model, _tmp)
 
     # ── snapshot / restore ────────────────────────────────────────────────────
 
