@@ -17,7 +17,8 @@ import pytest
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
 
-from env.navigation_env import NavigationEnv, NavRewardConfig
+from env.navigation_env import NavigationEnv
+from env.nav_reward import RewardConfig as NavRewardConfig
 from env.nav_obs import NAV_OBS_DIM, NavObsConfig
 from env.episode_reset import SpawnConfig, GoalConfig
 
@@ -215,7 +216,7 @@ class TestReward:
     def test_time_penalty_nonzero(self):
         """Idle robot should incur a time penalty (negative reward shift)."""
         cfg = NavRewardConfig(approach=0.0, obstacle=0.0,
-                              time_step=0.05, success=10.0, collision=5.0)
+                              time_step=0.05, goal=10.0, collision=5.0)
         e = NavigationEnv(reward_cfg=cfg, max_steps=5, n_substeps=1, seed=0)
         e.reset(seed=0)
         _, reward, _, _, _ = e.step(np.zeros(2))
@@ -245,12 +246,12 @@ class TestReward:
 
     def test_success_bonus_on_arrival(self):
         """Reward when goal_dist < goal_radius must include success bonus."""
-        rew_cfg = NavRewardConfig(success=20.0, goal_radius=100.0)  # very large radius
+        rew_cfg = NavRewardConfig(goal=20.0, goal_radius=100.0)  # very large radius
         e = NavigationEnv(reward_cfg=rew_cfg, max_steps=5, n_substeps=1, seed=0)
         e.reset(seed=0)
         _, reward, terminated, _, info = e.step(np.zeros(2))
         if info["success"]:
-            assert reward >= rew_cfg.success * 0.9   # bonus dominates
+            assert reward >= rew_cfg.goal * 0.9   # bonus dominates
         e.close()
 
     def test_collision_penalty_on_crash(self):
@@ -271,10 +272,8 @@ class TestActionMapping:
     def test_zero_action_stays_idle(self, env):
         env.reset(seed=0)
         pos_before = env._data.qpos[env._base_qadr : env._base_qadr + 2].copy()
-        env._apply_action(np.zeros(2))
         for _ in range(3):
-            import mujoco
-            mujoco.mj_step(env._model, env._data)
+            env.step(np.zeros(2))
         pos_after = env._data.qpos[env._base_qadr : env._base_qadr + 2].copy()
         assert np.linalg.norm(pos_after - pos_before) < 0.05
 
@@ -289,17 +288,15 @@ class TestActionMapping:
     def test_action_clipped_before_apply(self, env):
         env.reset(seed=0)
         # Should not raise even with out-of-bounds action
-        env._apply_action(np.array([5.0, -5.0]))
+        env.action_processor.process(np.array([5.0, -5.0]))
 
     def test_left_wheel_faster_turns_right(self, env):
-        """v_lin=0, v_ang>0 → left wheel slower, right wheel faster → turns right."""
+        """v_lin=0, v_ang>0 → left wheel backward, right wheel forward → turns left."""
         env.reset(seed=0)
-        import mujoco as mj
-        env._apply_action(np.array([0.0, 1.0]))
-        # ctrl[0] = (0 - 1) * MAX, ctrl[1] = (0 + 1) * MAX
-        from robot.constants import MAX_WHEEL_VEL
-        assert env._data.ctrl[0] < 0
-        assert env._data.ctrl[1] > 0
+        phys = env.action_processor.process(np.array([0.0, 1.0]))
+        # v_ang > 0 (CCW / left turn): left wheel slower (negative), right faster (positive)
+        assert phys.ctrl_left  < 0
+        assert phys.ctrl_right > 0
 
 
 # ── _goal_dist helper ──────────────────────────────────────────────────────────
@@ -375,7 +372,7 @@ class TestNavRewardConfig:
         assert cfg.approach    == pytest.approx(2.0)
         assert cfg.obstacle    == pytest.approx(0.5)
         assert cfg.time_step   == pytest.approx(0.01)
-        assert cfg.success     == pytest.approx(10.0)
+        assert cfg.goal        == pytest.approx(10.0)
         assert cfg.collision   == pytest.approx(5.0)
         assert cfg.danger_r    == pytest.approx(0.25)
         assert cfg.collision_r == pytest.approx(0.12)
@@ -387,9 +384,9 @@ class TestNavRewardConfig:
             cfg.approach = 99.0
 
     def test_custom_values(self):
-        cfg = NavRewardConfig(approach=5.0, success=20.0)
+        cfg = NavRewardConfig(approach=5.0, goal=20.0)
         assert cfg.approach == pytest.approx(5.0)
-        assert cfg.success  == pytest.approx(20.0)
+        assert cfg.goal     == pytest.approx(20.0)
 
 
 # ── multi-episode consistency ──────────────────────────────────────────────────

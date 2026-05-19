@@ -431,7 +431,7 @@ class TestTotalReward:
 
     def test_total_with_collision_penalty(self):
         fn = _fn(collision=5.0, collision_r=0.5, approach=0.0,
-                 explore=0.0, uncertainty=0.0, time_step=0.0)
+                 obstacle=0.0, explore=0.0, uncertainty=0.0, time_step=0.0)
         fn.reset(_ORIGIN)
         ri = _step(fn, d_lidar=0.1)
         assert ri.total == pytest.approx(-5.0, abs=1e-6)
