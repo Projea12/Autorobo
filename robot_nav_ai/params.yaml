@@ -1,0 +1,51 @@
+# params.yaml — single source of truth for every DVC pipeline stage.
+#
+# Every model knows exactly what data trained it because DVC locks each
+# stage's output to the exact param values that produced it.  Changing
+# any value here invalidates downstream cached outputs automatically.
+
+# ── YCB download ──────────────────────────────────────────────────────────────
+ycb_download:
+  dest_dir: data/ycb/raw
+  objects: null          # null → all 21; or list of canonical names
+  n_workers: 4
+  timeout: 30
+
+# ── YCB preprocessing ────────────────────────────────────────────────────────
+ycb_preprocess:
+  raw_dir:  data/ycb/raw
+  out_dir:  data/ycb/processed
+  objects: null          # null → all downloaded objects
+
+# ── synthetic data generation ─────────────────────────────────────────────────
+synth_generate:
+  n_images:      10000
+  out_dir:       data/synthetic
+  seed:          42
+  train_frac:    0.80
+  image_w:       640
+  image_h:       480
+  fovy:          45.0
+  jpeg_quality:  92
+  object_names:  null    # null → all 21 YCB objects
+  min_objects:   2
+  max_objects:   5
+  distance_min:  0.9
+  distance_max:  2.2
+  elev_min:     -55.0
+  elev_max:     -15.0
+  report_every:  500
+
+# ── label validation ──────────────────────────────────────────────────────────
+validate_labels:
+  label_dir:    data/synthetic/labels
+  image_dir:    data/synthetic/images
+  output_dir:   data/synthetic_validated
+  n_classes:    21
+  min_area:     1.0e-4
+  max_area:     0.99
+  min_ar:       0.02
+  max_ar:       50.0
+  max_iou:      0.85
+  conf:         0.0
+  clamp_border: true

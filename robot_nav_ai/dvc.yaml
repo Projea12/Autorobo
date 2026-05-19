@@ -1,0 +1,110 @@
+# dvc.yaml — Reproducible data pipeline for Autorobo.
+#
+# Run the full pipeline:   dvc repro
+# Run a single stage:      dvc repro validate_labels
+# Inspect stage status:    dvc status
+# Push outputs to remote:  dvc push
+# Pull on a new machine:   dvc pull
+#
+# Each stage is invalidated automatically when its params, deps, or
+# the scripts it calls change — so every model always knows the exact
+# dataset commit, seed, and parameters that produced its training data.
+
+stages:
+
+  # ── 1. Download raw YCB meshes ─────────────────────────────────────────────
+  download_ycb:
+    cmd: >-
+      python scripts/download_ycb.py download
+      --dest ${ycb_download.dest_dir}
+      --workers ${ycb_download.n_workers}
+      --timeout ${ycb_download.timeout}
+    deps:
+      - scripts/download_ycb.py
+      - data/ycb/downloader.py
+      - data/ycb/registry.py
+    params:
+      - ycb_download.dest_dir
+      - ycb_download.n_workers
+      - ycb_download.timeout
+    outs:
+      - ${ycb_download.dest_dir}:
+          cache: true
+          persist: true    # don't delete between runs; downloads are slow
+
+  # ── 2. Preprocess YCB meshes → MJCF bodies ────────────────────────────────
+  preprocess_ycb:
+    cmd: >-
+      python scripts/download_ycb.py preprocess
+      --raw  ${ycb_preprocess.raw_dir}
+      --out  ${ycb_preprocess.out_dir}
+    deps:
+      - scripts/download_ycb.py
+      - data/ycb/preprocessor.py
+      - data/ycb/registry.py
+      - ${ycb_preprocess.raw_dir}
+    params:
+      - ycb_preprocess.raw_dir
+      - ycb_preprocess.out_dir
+    outs:
+      - ${ycb_preprocess.out_dir}:
+          cache: true
+
+  # ── 3. Generate synthetic YOLO dataset ────────────────────────────────────
+  generate_synth:
+    cmd: >-
+      python scripts/generate_synth_data.py
+      --n          ${synth_generate.n_images}
+      --out        ${synth_generate.out_dir}
+      --seed       ${synth_generate.seed}
+      --train-frac ${synth_generate.train_frac}
+      --size       ${synth_generate.image_w} ${synth_generate.image_h}
+      --fovy       ${synth_generate.fovy}
+      --jpeg-quality ${synth_generate.jpeg_quality}
+      --min-obj    ${synth_generate.min_objects}
+      --max-obj    ${synth_generate.max_objects}
+      --dist       ${synth_generate.distance_min} ${synth_generate.distance_max}
+      --elev       ${synth_generate.elev_min} ${synth_generate.elev_max}
+      --report     ${synth_generate.report_every}
+    deps:
+      - scripts/generate_synth_data.py
+      - data/synth/pipeline.py
+      - data/synth/scene.py
+      - data/synth/camera.py
+      - data/synth/annotator.py
+      - data/ycb/registry.py
+    params:
+      - synth_generate
+    outs:
+      - ${synth_generate.out_dir}:
+          cache: true
+
+  # ── 4. Validate and repair labels ─────────────────────────────────────────
+  validate_labels:
+    cmd: >-
+      python scripts/validate_labels.py
+      --labels  ${validate_labels.label_dir}
+      --images  ${validate_labels.image_dir}
+      --output  ${validate_labels.output_dir}
+      --n-classes ${validate_labels.n_classes}
+      --min-area  ${validate_labels.min_area}
+      --max-area  ${validate_labels.max_area}
+      --min-ar    ${validate_labels.min_ar}
+      --max-ar    ${validate_labels.max_ar}
+      --max-iou   ${validate_labels.max_iou}
+      --conf      ${validate_labels.conf}
+    deps:
+      - scripts/validate_labels.py
+      - data/annotation/validator.py
+      - data/annotation/pipeline.py
+      - ${validate_labels.label_dir}
+    params:
+      - validate_labels
+    metrics:
+      - ${validate_labels.output_dir}/report.json:
+          cache: false    # small JSON — commit it, don't cache
+    outs:
+      - ${validate_labels.output_dir}/labels:
+          cache: true
+      - ${validate_labels.output_dir}/report.txt:
+          cache: false
