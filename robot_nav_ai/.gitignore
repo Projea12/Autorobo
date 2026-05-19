@@ -6,3 +6,14 @@ models/*.zip
 logs/
 videos/
 .DS_Store
+
+# DVC cache and tmp (the .dvc/ config is committed, not the cache)
+.dvc/cache/
+.dvc/tmp/
+.dvc/plots/
+
+# Generated data directories (tracked by DVC, not git)
+data/ycb/raw/
+data/ycb/processed/
+data/synthetic/
+data/synthetic_validated/

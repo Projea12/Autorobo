@@ -48,6 +48,7 @@ import numpy as np
 from .annotator import Annotator, CLASS_NAMES
 from .camera import CameraConfig, camera_pose_from_spherical
 from .scene import SceneConfig, SynthScene
+from data.dvc_utils import lineage_stamp
 
 
 # ── configuration ─────────────────────────────────────────────────────────────
@@ -343,5 +344,6 @@ def _write_manifest(
         "class_names":        CLASS_NAMES,
         "image_size":         [cfg.scene_cfg.image_w, cfg.scene_cfg.image_h],
         "jpeg_quality":       cfg.jpeg_quality,
+        "lineage":            lineage_stamp(stage="generate_synth"),
     }
     path.write_text(json.dumps(manifest, indent=2))
