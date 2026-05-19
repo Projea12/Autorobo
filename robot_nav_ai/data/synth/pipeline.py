@@ -49,6 +49,7 @@ from .annotator import Annotator, CLASS_NAMES
 from .camera import CameraConfig, camera_pose_from_spherical
 from .scene import SceneConfig, SynthScene
 from data.dvc_utils import lineage_stamp
+from data.splits import SplitConfig, SplitManager
 
 
 # ── configuration ─────────────────────────────────────────────────────────────
@@ -69,16 +70,17 @@ class PipelineConfig:
     max_depth     : max object depth in metres (Annotator filter)
     report_every  : print progress every N images (0 = silent)
     """
-    n_images:      int         = 1000
-    out_dir:       str         = "data/synthetic"
-    train_frac:    float       = 0.80
+    n_images:      int           = 1000
+    out_dir:       str           = "data/synthetic"
+    train_frac:    float         = 0.80   # kept for back-compat; overridden by split_cfg
     seed:          Optional[int] = 42
-    scene_cfg:     SceneConfig = field(default_factory=SceneConfig)
-    cam_cfg:       CameraConfig = field(default_factory=CameraConfig)
-    jpeg_quality:  int         = 92
-    min_area_frac: float       = 0.002
-    max_depth:     float       = 5.0
-    report_every:  int         = 100
+    scene_cfg:     SceneConfig   = field(default_factory=SceneConfig)
+    cam_cfg:       CameraConfig  = field(default_factory=CameraConfig)
+    jpeg_quality:  int           = 92
+    min_area_frac: float         = 0.002
+    max_depth:     float         = 5.0
+    report_every:  int           = 100
+    split_cfg:     SplitConfig   = field(default_factory=SplitConfig)
 
 
 # ── statistics ────────────────────────────────────────────────────────────────
@@ -93,6 +95,7 @@ class GenerationStats:
     n_empty:       int    # images with 0 detections
     elapsed_s:     float
     out_dir:       str
+    n_test:        int = 0
 
     @property
     def images_per_second(self) -> float:
@@ -106,7 +109,7 @@ class GenerationStats:
         return (
             f"Generated {self.n_total} images in {self.elapsed_s:.1f}s "
             f"({self.images_per_second:.1f} img/s)\n"
-            f"  train={self.n_train}  val={self.n_val}\n"
+            f"  train={self.n_train}  val={self.n_val}  test={self.n_test}\n"
             f"  detections={self.n_detections}  "
             f"mean_per_img={self.mean_dets_per_image:.2f}  "
             f"empty_imgs={self.n_empty}\n"
@@ -138,11 +141,20 @@ class SynthPipeline:
         rng = np.random.default_rng(cfg.seed)
 
         out      = Path(cfg.out_dir)
-        n_train  = int(cfg.n_images * cfg.train_frac)
-        n_val    = cfg.n_images - n_train
+
+        # Pre-assign split for every image stem using SplitManager
+        all_stems    = [f"{i:06d}" for i in range(cfg.n_images)]
+        split_mgr    = SplitManager(
+            cfg           = cfg.split_cfg,
+            manifest_path = out / "split_manifest.json",
+        )
+        assignments  = split_mgr.assign_all(all_stems)
+        n_train      = sum(1 for s in assignments.values() if s == "train")
+        n_val        = sum(1 for s in assignments.values() if s == "val")
+        n_test       = sum(1 for s in assignments.values() if s == "test")
 
         # Directory layout
-        for split in ("train", "val"):
+        for split in ("train", "val", "test"):
             (out / "images" / split).mkdir(parents=True, exist_ok=True)
             (out / "labels" / split).mkdir(parents=True, exist_ok=True)
 
@@ -161,69 +173,73 @@ class SynthPipeline:
         n_dets   = 0
         n_empty  = 0
         t0       = time.perf_counter()
-        img_idx  = 0
 
-        for split, n_split in (("train", n_train), ("val", n_val)):
-            for _ in range(n_split):
-                # ── 1. randomise scene ────────────────────────────────────────
-                active = scene.reset(data, rng)
+        for img_idx, stem in enumerate(all_stems):
+            split = assignments[stem]
 
-                # ── 2. randomise lighting ─────────────────────────────────────
-                self._randomise_lighting(scene.model, rng)
+            # ── 1. randomise scene ────────────────────────────────────────────
+            active = scene.reset(data, rng)
 
-                # ── 3. camera pose ────────────────────────────────────────────
-                pose     = cfg.cam_cfg.sample_pose(rng)
-                cam_pos, R = camera_pose_from_spherical(**pose)
+            # ── 2. randomise lighting ─────────────────────────────────────────
+            self._randomise_lighting(scene.model, rng)
 
-                mjvcam = mujoco.MjvCamera()
-                mjvcam.type        = mujoco.mjtCamera.mjCAMERA_FREE
-                mjvcam.lookat[:]   = pose["lookat"]
-                mjvcam.distance    = pose["distance"]
-                mjvcam.azimuth     = pose["azimuth"]
-                mjvcam.elevation   = pose["elevation"]
+            # ── 3. camera pose ────────────────────────────────────────────────
+            pose       = cfg.cam_cfg.sample_pose(rng)
+            cam_pos, R = camera_pose_from_spherical(**pose)
 
-                # ── 4. render ─────────────────────────────────────────────────
-                renderer.update_scene(data, camera=mjvcam)
-                rgb = renderer.render()   # (H, W, 3) uint8
+            mjvcam = mujoco.MjvCamera()
+            mjvcam.type        = mujoco.mjtCamera.mjCAMERA_FREE
+            mjvcam.lookat[:]   = pose["lookat"]
+            mjvcam.distance    = pose["distance"]
+            mjvcam.azimuth     = pose["azimuth"]
+            mjvcam.elevation   = pose["elevation"]
 
-                # ── 5. annotate ───────────────────────────────────────────────
-                dets = annotator.annotate(active, data, cam_pos, R, scene)
+            # ── 4. render ─────────────────────────────────────────────────────
+            renderer.update_scene(data, camera=mjvcam)
+            rgb = renderer.render()   # (H, W, 3) uint8
 
-                # ── 6. write image ────────────────────────────────────────────
-                stem = f"{img_idx:06d}"
-                img_path = out / "images" / split / f"{stem}.jpg"
-                _write_jpeg(rgb, img_path, cfg.jpeg_quality)
+            # ── 5. annotate ───────────────────────────────────────────────────
+            dets = annotator.annotate(active, data, cam_pos, R, scene)
 
-                # ── 7. write label ────────────────────────────────────────────
-                lbl_path = out / "labels" / split / f"{stem}.txt"
-                lbl_path.write_text(
-                    "\n".join(d.yolo_line() for d in dets)
-                )
+            # ── 6. write image ────────────────────────────────────────────────
+            img_path = out / "images" / split / f"{stem}.jpg"
+            _write_jpeg(rgb, img_path, cfg.jpeg_quality)
 
-                n_dets  += len(dets)
-                n_empty += (len(dets) == 0)
+            # ── 7. write label ────────────────────────────────────────────────
+            lbl_path = out / "labels" / split / f"{stem}.txt"
+            lbl_path.write_text("\n".join(d.yolo_line() for d in dets))
 
-                if cfg.report_every and (img_idx + 1) % cfg.report_every == 0:
-                    elapsed = time.perf_counter() - t0
-                    rate    = (img_idx + 1) / elapsed
-                    print(f"  [{img_idx+1:6d}/{cfg.n_images}]  "
-                          f"{rate:.1f} img/s  "
-                          f"split={split}  dets={len(dets)}")
+            n_dets  += len(dets)
+            n_empty += (len(dets) == 0)
 
-                img_idx += 1
+            if cfg.report_every and (img_idx + 1) % cfg.report_every == 0:
+                elapsed = time.perf_counter() - t0
+                rate    = (img_idx + 1) / elapsed
+                print(f"  [{img_idx+1:6d}/{cfg.n_images}]  "
+                      f"{rate:.1f} img/s  "
+                      f"split={split}  dets={len(dets)}")
 
         renderer.close()
 
         # ── 8. write dataset.yaml ─────────────────────────────────────────────
-        yaml_path = out / "dataset.yaml"
-        _write_dataset_yaml(yaml_path, out, CLASS_NAMES)
+        _write_dataset_yaml(out / "dataset.yaml", out, CLASS_NAMES)
 
-        # ── 9. write generation manifest ─────────────────────────────────────
+        # ── 9. write split manifest ───────────────────────────────────────────
+        stamp = lineage_stamp(stage="generate_synth")
+        split_manifest = split_mgr.build_manifest(
+            stems   = all_stems,
+            lineage = stamp,
+            extra   = {"n_images": cfg.n_images, "seed": cfg.seed},
+        )
+        split_manifest.save(out / "split_manifest.json")
+
+        # ── 10. write generation manifest ─────────────────────────────────────
         elapsed = time.perf_counter() - t0
         stats   = GenerationStats(
             n_total      = cfg.n_images,
             n_train      = n_train,
             n_val        = n_val,
+            n_test       = n_test,
             n_detections = n_dets,
             n_empty      = n_empty,
             elapsed_s    = elapsed,
@@ -330,10 +346,12 @@ def _write_manifest(
     cfg:   PipelineConfig,
     stats: GenerationStats,
 ) -> None:
+    from dataclasses import asdict
     manifest = {
         "n_images":           stats.n_total,
         "n_train":            stats.n_train,
         "n_val":              stats.n_val,
+        "n_test":             stats.n_test,
         "n_detections":       stats.n_detections,
         "n_empty":            stats.n_empty,
         "mean_dets_per_img":  stats.mean_dets_per_image,
@@ -344,6 +362,7 @@ def _write_manifest(
         "class_names":        CLASS_NAMES,
         "image_size":         [cfg.scene_cfg.image_w, cfg.scene_cfg.image_h],
         "jpeg_quality":       cfg.jpeg_quality,
+        "split_config":       asdict(cfg.split_cfg),
         "lineage":            lineage_stamp(stage="generate_synth"),
     }
     path.write_text(json.dumps(manifest, indent=2))

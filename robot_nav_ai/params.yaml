@@ -22,7 +22,12 @@ synth_generate:
   n_images:      10000
   out_dir:       data/synthetic
   seed:          42
-  train_frac:    0.80
+  train_frac:    0.75   # kept for back-compat; split_cfg governs actual splits
+  split_train_frac: 0.75
+  split_val_frac:   0.15
+  split_test_frac:  0.10
+  split_seed:       42
+  split_lock_test:  true
   image_w:       640
   image_h:       480
   fovy:          45.0
