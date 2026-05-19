@@ -370,3 +370,6 @@ WARNING: EPA: out of memory for faces on expanding polytope
 Tue May 19 06:45:12 2026
 WARNING: ARB_clip_control unavailable while mjDEPTH_ZEROFAR requested, depth accuracy will be limited
 
+Tue May 19 10:48:27 2026
+WARNING: ARB_clip_control unavailable while mjDEPTH_ZEROFAR requested, depth accuracy will be limited
+
