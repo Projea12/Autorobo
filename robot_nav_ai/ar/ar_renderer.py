@@ -48,9 +48,9 @@ class ARConfig:
     intrinsics:    CameraIntrinsics = field(default_factory=CameraIntrinsics)
 
     # Where the robot stands in the AR world (OpenCV world frame, metres)
-    # x=0 centre, y=0 at camera height, z=1.5 → 1.5 m in front of start
+    # x=0 centre, y=1.2 below camera (floor level), z=1.2 in front
     robot_world_pos: np.ndarray = field(
-        default_factory=lambda: np.array([0.0, 0.3, 1.5])
+        default_factory=lambda: np.array([0.0, 1.2, 1.2])
     )
 
     # Virtual camera for robot sprite
@@ -185,8 +185,8 @@ class ARRenderer:
         v  = int(K.fy * p_cam[1] / z + K.cy)
         # Clamp to frame so robot never fully disappears
         h, w = self.cfg.render_height, self.cfg.render_width
-        u = int(np.clip(u, w // 6, w * 5 // 6))
-        v = int(np.clip(v, h // 3, h - 20))
+        u = int(np.clip(u, w // 5, w * 4 // 5))
+        v = int(np.clip(v, h // 2, h - 10))   # always in lower half = on the floor
         return u, v, z
 
     def _get_sprite(
@@ -235,7 +235,10 @@ class ARRenderer:
             rgb  = rgb[r0:r1, c0:c1]
             mask = mask[r0:r1, c0:c1]
 
-        self._sprite_rgb  = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        # Boost brightness to match typical indoor webcam exposure
+        bgr = cv2.convertScaleAbs(bgr, alpha=1.6, beta=30)
+        self._sprite_rgb  = bgr
         self._sprite_mask = mask
         self._sprite_dirty = False
 
