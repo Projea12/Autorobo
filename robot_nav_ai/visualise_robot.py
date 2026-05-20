@@ -76,20 +76,19 @@ def main():
     # Launch the interactive viewer (blocks until window is closed)
     with mujoco.viewer.launch_passive(model, data) as viewer:
 
-        # Point camera at the robot centre from a good angle
-        viewer.cam.lookat[:] = [0.0, 0.0, 0.35]
-        viewer.cam.distance  = 2.2
-        viewer.cam.azimuth   = -50
-        viewer.cam.elevation = -20
+        # Point camera at the robot from a good angle
+        viewer.cam.lookat[:] = [0.1, 0.0, 0.35]
+        viewer.cam.distance  = 2.5
+        viewer.cam.azimuth   = -60
+        viewer.cam.elevation = -18
 
         print("MuJoCo viewer open.  Close the window or press Ctrl+C to exit.")
 
         while viewer.is_running():
-            # Step physics slowly so the robot stays roughly in place
-            # (it will drift slightly due to gravity — press Backspace to reset)
-            mujoco.mj_step(model, data)
+            # Do NOT step physics — robot stays locked in keyframe pose.
+            # Drag to rotate, scroll to zoom, Backspace to reset.
             viewer.sync()
-            time.sleep(0.002)   # match timestep=0.002 in robot.xml
+            time.sleep(0.016)   # ~60 fps refresh
 
 
 if __name__ == "__main__":

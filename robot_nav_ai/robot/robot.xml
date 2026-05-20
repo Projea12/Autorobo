@@ -130,14 +130,22 @@
       <body name="wheel_left" pos="0 0.225 -0.05">
         <joint name="wheel_left_joint" type="hinge" axis="0 1 0" class="wheel"/>
         <geom  name="wheel_left_geom"  type="cylinder" size="0.100 0.030"
-               mass="0.50" class="wheel"/>
+               euler="1.5708 0 0" mass="0.50" class="wheel"/>
+        <!-- hub disc -->
+        <geom  name="wheel_left_hub"   type="cylinder" size="0.045 0.005"
+               pos="0 0.032 0" euler="1.5708 0 0" mass="0.01"
+               rgba="0.70 0.70 0.70 1"/>
       </body>
 
       <!-- ── Right drive wheel ── -->
       <body name="wheel_right" pos="0 -0.225 -0.05">
         <joint name="wheel_right_joint" type="hinge" axis="0 1 0" class="wheel"/>
         <geom  name="wheel_right_geom"  type="cylinder" size="0.100 0.030"
-               mass="0.50" class="wheel"/>
+               euler="1.5708 0 0" mass="0.50" class="wheel"/>
+        <!-- hub disc -->
+        <geom  name="wheel_right_hub"   type="cylinder" size="0.045 0.005"
+               pos="0 -0.032 0" euler="1.5708 0 0" mass="0.01"
+               rgba="0.70 0.70 0.70 1"/>
       </body>
 
       <!-- ══════════════════ 6-DOF ARM ═══════════════════════════════════
@@ -381,25 +389,29 @@
       home: arm straight up (joint2 = π/2), elbow/wrist neutral, gripper closed.
       Safe transport pose — no horizontal reach, minimal collision risk.
     -->
+    <!--
+      home: arm straight UP — safe transport pose, no horizontal reach.
+      joint2 = −π/2 → upper arm points along +Z (upward).
+    -->
     <key name="home"
-         qpos="0 0 0.15  1 0 0 0  0 0  0 1.5708 0 0 0 0  0 0"
-         ctrl="0 0  0 1.5708 0 0 0 0  0"/>
+         qpos="0 0 0.15  1 0 0 0  0 0  0 -1.5708 0 0 0 0  0 0"
+         ctrl="0 0  0 -1.5708 0 0 0 0  0"/>
 
     <!--
-      ready: arm angled forward to approach objects on a 0.4 m table.
-      joint2 = π/4  → upper arm at 45° from horizontal
-      joint3 = −π/3 → elbow bent 60°, forearm pointing forward-down
+      ready: arm reaching forward-down toward desk height (~0.40 m).
+      joint2 = −π/4 → upper arm at 45° above horizontal
+      joint3 = +π/3 → elbow bends forearm forward-down
     -->
     <key name="ready"
-         qpos="0 0 0.15  1 0 0 0  0 0  0 0.7854 -1.0472 0 0 0  0 0"
-         ctrl="0 0  0 0.7854 -1.0472 0 0 0  0"/>
+         qpos="0 0 0.15  1 0 0 0  0 0  0 -0.7854 1.0472 0 0 0  0 0"
+         ctrl="0 0  0 -0.7854 1.0472 0 0 0  0"/>
 
     <!--
-      grasp_open: arm angled forward, gripper fully open (0.04 m per finger = 118 mm gap).
+      grasp_open: ready pose with gripper fully open (118 mm gap).
     -->
     <key name="grasp_open"
-         qpos="0 0 0.15  1 0 0 0  0 0  0 0.7854 -1.0472 0 0 0  0.04 0.04"
-         ctrl="0 0  0 0.7854 -1.0472 0 0 0  0.04"/>
+         qpos="0 0 0.15  1 0 0 0  0 0  0 -0.7854 1.0472 0 0 0  0.04 0.04"
+         ctrl="0 0  0 -0.7854 1.0472 0 0 0  0.04"/>
   </keyframe>
 
 </mujoco>
