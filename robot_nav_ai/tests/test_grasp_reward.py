@@ -223,7 +223,10 @@ class TestStabilityReward:
         assert info.stability < 0.0
 
     def test_no_lift_no_stability(self):
-        fn = _fn()   # not lifted
+        # lift_thresh=0.10 so OBJ at z=0.05 never triggers lift
+        cfg = GraspRewardConfig(lift_thresh=0.10, table_z=0.0)
+        fn = GraspRewardFunction(cfg)
+        fn.reset(obj_pos=OBJ, ee_pos=EE_NEAR)
         info = fn.step(ee_pos=EE_NEAR, obj_pos=OBJ, n_touching=2)
         assert info.stability == pytest.approx(0.0)
 

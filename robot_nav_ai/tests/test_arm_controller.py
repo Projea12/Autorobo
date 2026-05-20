@@ -82,15 +82,16 @@ _ARM_XML = """
 """
 
 _CFG = ArmControllerConfig(
-    damping        = 0.05,
-    max_joint_vel  = 1.5,
-    dt             = 0.010,
-    robot_geomgroup= 1,
-    n_arm_joints   = 6,
-    arm_ctrl_start = 0,   # no wheels in test model
+    damping          = 0.05,
+    max_joint_vel    = 1.5,
+    dt               = 0.010,
+    robot_geomgroup  = 1,
+    n_arm_joints     = 6,
+    arm_ctrl_start   = 0,   # no wheels in test model
     gripper_ctrl_idx = -1,
     gripper_open_pos = 0.04,
-    gripper_close_pos = 0.0,
+    gripper_close_pos= 0.0,
+    qpos_arm_start   = 0,   # no freejoint prefix in test model
 )
 
 

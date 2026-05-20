@@ -92,6 +92,7 @@ class ArmControllerConfig:
     gripper_ctrl_idx:  int   = 8
     gripper_open_pos:  float = 0.040    # m — matches finger_pos_max
     gripper_close_pos: float = 0.0      # m — fully closed
+    qpos_arm_start:    int   = 7        # qpos offset to first arm joint (7 = after base freejoint)
 
 
 # ── result ────────────────────────────────────────────────────────────────────
@@ -284,10 +285,9 @@ class ArmController:
 
     def _current_q(self) -> np.ndarray:
         """Return current arm joint positions as (n_arm_joints,) float64."""
-        n = self.cfg.n_arm_joints
-        # qpos layout: base freejoint(7) + arm(6) + gripper fingers(2)
-        # arm joints start at qpos index 7
-        return self._data.qpos[7: 7 + n].copy()
+        n   = self.cfg.n_arm_joints
+        s   = self.cfg.qpos_arm_start
+        return self._data.qpos[s: s + n].copy()
 
     def _gripper_target(self, cmd: GripperCmd) -> float:
         """Map GripperCmd enum to a finger position target [m]."""
