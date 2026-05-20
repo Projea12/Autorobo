@@ -28,7 +28,7 @@ class TestSACConfig:
         assert cfg.buffer_size          == 500_000
         assert cfg.batch_size           == 256
         assert cfg.gamma                == pytest.approx(0.99)
-        assert cfg.use_her              is True
+        assert cfg.use_her              is False
         assert cfg.her_n_sampled_goals  == 4
         assert cfg.her_goal_selection   == "future"
         assert cfg.ent_coef             == "auto"
@@ -74,9 +74,9 @@ class TestTrainerConstruction:
         t = self._trainer()
         assert t._model is None
 
-    def test_her_enabled_by_default(self):
+    def test_her_disabled_by_default(self):
         t = self._trainer()
-        assert t.cfg.use_her is True
+        assert t.cfg.use_her is False
 
     def test_her_disabled_via_config(self):
         cfg = SACConfig(use_her=False)

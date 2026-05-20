@@ -234,7 +234,7 @@ class GraspPolicyEvaluator:
         # Generalisation drop
         known_sr  = next((s.success_rate for s in results if s.scenario == "known"),  None)
         novel_sr  = next((s.success_rate for s in results if s.scenario == "novel"),  None)
-        gen_drop  = (known_sr - novel_sr) if (known_sr and novel_sr) else None
+        gen_drop  = (known_sr - novel_sr) if (known_sr is not None and novel_sr is not None) else None
 
         model_path = (
             str(getattr(self._model, "_logger", None) or "random_policy")
