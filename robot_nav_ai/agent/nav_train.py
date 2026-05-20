@@ -188,11 +188,14 @@ def train(cfg: NavTrainConfig, resume: Optional[str] = None) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[nav_train] device={device}  total_steps={cfg.total_steps:,}")
 
+    rew_s0 = _reward_cfg_stage0()
+    rew_s1 = _reward_cfg_stage1()
+
     # --- build initial env (stage 0) ---
     env = NavigationEnv(
         max_steps   = cfg.max_episode_steps,
         n_substeps  = cfg.n_substeps,
-        reward_cfg  = _reward_cfg_stage0(),
+        reward_cfg  = rew_s0,
         goal_cfg    = _goal_cfg_stage0(),
         seed        = cfg.seed,
     )
@@ -203,14 +206,14 @@ def train(cfg: NavTrainConfig, resume: Optional[str] = None) -> None:
     agent = make_ppo_agent(obs_dim, act_dim, cfg.ppo, device=device)
 
     # --- checkpointer & tensorboard ---
-    ckpt  = _SimpleCheckpointer(cfg.ckpt_dir, keep_last=cfg.keep_last)
+    ckpt   = _SimpleCheckpointer(cfg.ckpt_dir, keep_last=cfg.keep_last)
     writer = _try_tensorboard(cfg.log_dir, cfg.run_name)
 
-    global_step  = 0
-    episode_step = 0
-    ep_rewards: list[float] = []
-    ep_lengths: list[int]   = []
-    ep_successes: list[bool] = []
+    global_step   = 0
+    ep_rewards:   list[float] = []
+    ep_lengths:   list[int]   = []
+    ep_successes: list[bool]  = []
+    resumed_wandb_run_id: Optional[str] = None
 
     # --- resume ---
     if resume is not None:
@@ -223,10 +226,19 @@ def train(cfg: NavTrainConfig, resume: Optional[str] = None) -> None:
         if load_path and load_path.exists():
             sd = torch.load(load_path, map_location=device)
             agent.load_state_dict(sd["agent"])
-            global_step = sd.get("global_step", 0)
+            global_step           = sd.get("global_step", 0)
+            resumed_wandb_run_id  = sd.get("wandb_run_id")
             print(f"[nav_train] resumed from {load_path} (step {global_step:,})")
         else:
             print(f"[nav_train] WARNING: checkpoint not found: {resume}")
+
+    # --- W&B init (after resume so we recover the run ID) ---
+    wb = WandbLogger(cfg.wandb)
+    wandb_run_id = wb.init(
+        run_name      = cfg.run_name,
+        hparams       = build_hparams(cfg, rew_s0, rew_s1, obs_dim, act_dim),
+        resume_run_id = resumed_wandb_run_id,
+    )
 
     obs_np, _ = env.reset(seed=cfg.seed)
     obs_t     = torch.as_tensor(obs_np, dtype=torch.float32, device=device)
@@ -245,7 +257,7 @@ def train(cfg: NavTrainConfig, resume: Optional[str] = None) -> None:
             env = NavigationEnv(
                 max_steps  = cfg.max_episode_steps,
                 n_substeps = cfg.n_substeps,
-                reward_cfg = _reward_cfg_stage1(),
+                reward_cfg = rew_s1,
                 goal_cfg   = _goal_cfg_stage1(),
                 seed       = cfg.seed + 1,
             )
@@ -254,7 +266,6 @@ def train(cfg: NavTrainConfig, resume: Optional[str] = None) -> None:
             ep_reward = 0.0
             ep_len    = 0
             done      = False
-            # rebuild buffer in agent with same dims (same obs/act dim)
             from agent.ppo import RolloutBuffer
             agent.rollout_buffer = RolloutBuffer(
                 n_steps    = cfg.ppo.n_steps,
@@ -265,6 +276,7 @@ def train(cfg: NavTrainConfig, resume: Optional[str] = None) -> None:
                 device     = device,
             )
             print(f"[nav_train] stage 1 active at step {global_step:,}")
+            wb.log({"curriculum/stage": 1}, step=global_step)
 
         # ── collect one rollout ──
         buf = agent.rollout_buffer
@@ -279,7 +291,7 @@ def train(cfg: NavTrainConfig, resume: Optional[str] = None) -> None:
 
             buf.add(obs_t, act, lp, val, float(rew), done)
 
-            obs_t     = torch.as_tensor(obs_np2, dtype=torch.float32, device=device)
+            obs_t      = torch.as_tensor(obs_np2, dtype=torch.float32, device=device)
             ep_reward += float(rew)
             ep_len    += 1
             global_step += 1
@@ -307,10 +319,11 @@ def train(cfg: NavTrainConfig, resume: Optional[str] = None) -> None:
 
         # ── logging ──
         if ep_rewards and global_step % cfg.log_interval < cfg.ppo.n_steps:
-            mean_rew = float(np.mean(ep_rewards[-20:]))
-            mean_len = float(np.mean(ep_lengths[-20:]))
+            mean_rew  = float(np.mean(ep_rewards[-20:]))
+            mean_len  = float(np.mean(ep_lengths[-20:]))
             succ_rate = float(np.mean(ep_successes[-20:])) if ep_successes else 0.0
-            fps  = global_step / max(time.time() - t_start, 1)
+            fps       = global_step / max(time.time() - t_start, 1)
+
             print(
                 f"step={global_step:>9,}  stage={stage}"
                 f"  rew={mean_rew:+.2f}  len={mean_len:.0f}"
@@ -318,22 +331,33 @@ def train(cfg: NavTrainConfig, resume: Optional[str] = None) -> None:
                 f"  pg={metrics['loss/policy']:.4f}"
                 f"  vf={metrics['loss/value']:.4f}"
             )
+
+            log_dict = {
+                "train/mean_reward":  mean_rew,
+                "train/mean_ep_len":  mean_len,
+                "train/success_rate": succ_rate,
+                "train/fps":          fps,
+                "curriculum/stage":   stage,
+                **metrics,
+            }
+            wb.log(log_dict, step=global_step)
+
             if writer:
-                writer.add_scalar("train/mean_reward",   mean_rew,   global_step)
-                writer.add_scalar("train/mean_ep_len",   mean_len,   global_step)
-                writer.add_scalar("train/success_rate",  succ_rate,  global_step)
-                writer.add_scalar("train/fps",           fps,        global_step)
-                for k, v in metrics.items():
+                for k, v in log_dict.items():
                     writer.add_scalar(k, v, global_step)
 
         # ── checkpoint ──
         if global_step % cfg.save_interval < cfg.ppo.n_steps:
             mean_rew = float(np.mean(ep_rewards[-20:])) if ep_rewards else 0.0
-            ckpt.save(agent, global_step, mean_rew)
+            ckpt.save(agent, global_step, mean_rew, wandb_run_id=wandb_run_id)
+            wb.log({"checkpoint/mean_reward": mean_rew,
+                    "checkpoint/global_step":  global_step}, step=global_step)
             print(f"[nav_train] checkpoint saved at step {global_step:,}"
-                  f"  mean_rew={mean_rew:.2f}")
+                  f"  mean_rew={mean_rew:.2f}"
+                  + (f"  wandb={wandb_run_id}" if wandb_run_id else ""))
 
     env.close()
+    wb.finish()
     if writer:
         writer.close()
     print(f"[nav_train] training complete at step {global_step:,}")
@@ -343,21 +367,55 @@ def train(cfg: NavTrainConfig, resume: Optional[str] = None) -> None:
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train PPO navigation policy")
-    p.add_argument("--resume",          type=str, default=None,
+
+    # --- run control ---
+    p.add_argument("--resume",        type=str,   default=None,
                    help="latest | best | step_XXXXXXXXXX")
-    p.add_argument("--total-steps",     type=int, default=NavTrainConfig.total_steps)
-    p.add_argument("--stage0-steps",    type=int, default=NavTrainConfig.stage0_steps)
-    p.add_argument("--seed",            type=int, default=NavTrainConfig.seed)
-    p.add_argument("--run-name",        type=str, default=NavTrainConfig.run_name)
-    p.add_argument("--ckpt-dir",        type=str, default=NavTrainConfig.ckpt_dir)
-    p.add_argument("--lr",              type=float, default=PPOConfig.lr)
-    p.add_argument("--n-steps",         type=int, default=PPOConfig.n_steps)
+    p.add_argument("--total-steps",   type=int,   default=NavTrainConfig.total_steps)
+    p.add_argument("--stage0-steps",  type=int,   default=NavTrainConfig.stage0_steps)
+    p.add_argument("--seed",          type=int,   default=NavTrainConfig.seed)
+    p.add_argument("--run-name",      type=str,   default=NavTrainConfig.run_name)
+    p.add_argument("--ckpt-dir",      type=str,   default=NavTrainConfig.ckpt_dir)
+
+    # --- PPO ---
+    p.add_argument("--lr",            type=float, default=PPOConfig.lr)
+    p.add_argument("--n-steps",       type=int,   default=PPOConfig.n_steps)
+    p.add_argument("--batch-size",    type=int,   default=PPOConfig.batch_size)
+    p.add_argument("--n-epochs",      type=int,   default=PPOConfig.n_epochs)
+    p.add_argument("--ent-coef",      type=float, default=PPOConfig.ent_coef)
+
+    # --- W&B ---
+    p.add_argument("--wandb-project", type=str,   default=WandbConfig.project,
+                   help="W&B project name")
+    p.add_argument("--wandb-entity",  type=str,   default=None,
+                   help="W&B team or username (default: personal account)")
+    p.add_argument("--wandb-group",   type=str,   default=None,
+                   help="W&B run group for organising sweeps")
+    p.add_argument("--wandb-tags",    type=str,   nargs="*", default=[],
+                   help="Space-separated list of W&B tags")
+    p.add_argument("--no-wandb",      action="store_true",
+                   help="Disable W&B logging entirely")
+
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse_args()
-    ppo_cfg = PPOConfig(lr=args.lr, n_steps=args.n_steps)
+
+    ppo_cfg = PPOConfig(
+        lr         = args.lr,
+        n_steps    = args.n_steps,
+        batch_size = args.batch_size,
+        n_epochs   = args.n_epochs,
+        ent_coef   = args.ent_coef,
+    )
+    wandb_cfg = WandbConfig(
+        project = args.wandb_project,
+        entity  = args.wandb_entity,
+        group   = args.wandb_group,
+        tags    = tuple(args.wandb_tags),
+        mode    = "disabled" if args.no_wandb else "online",
+    )
     cfg = NavTrainConfig(
         total_steps  = args.total_steps,
         stage0_steps = args.stage0_steps,
@@ -365,5 +423,6 @@ if __name__ == "__main__":
         run_name     = args.run_name,
         ckpt_dir     = args.ckpt_dir,
         ppo          = ppo_cfg,
+        wandb        = wandb_cfg,
     )
     train(cfg, resume=args.resume)
