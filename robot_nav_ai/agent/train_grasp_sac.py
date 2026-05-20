@@ -267,6 +267,7 @@ class GraspSACTrainer:
         return callbacks
 
     def _save(self, tag: str) -> Path:
+        self.ckpt_dir.mkdir(parents=True, exist_ok=True)
         path = self.ckpt_dir / f"sac_grasp_{tag}"
         self._model.save(str(path))
         log.info("Saved checkpoint: %s.zip", path)
