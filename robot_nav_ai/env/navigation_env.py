@@ -219,8 +219,14 @@ class NavigationEnv(gym.Env):
         RGBDFrame with rgb (H,W,3 uint8) and depth (H,W float32 metres).
         """
         from perception.rgbd_camera import RGBDCamera, RGBDConfig
+        if cfg is not None:
+            cam = RGBDCamera(cfg, self._model)
+            mujoco.mj_forward(self._model, self._data)
+            frame = cam.capture(self._data, step=self._step_count)
+            cam.close()
+            return frame
         if self._rgbd_cam is None:
-            self._rgbd_cam = RGBDCamera(cfg or RGBDConfig(), self._model)
+            self._rgbd_cam = RGBDCamera(RGBDConfig(), self._model)
         mujoco.mj_forward(self._model, self._data)
         return self._rgbd_cam.capture(self._data, step=self._step_count)
 
@@ -336,15 +342,11 @@ class NavigationEnv(gym.Env):
             act.ctrlrange = [-max_rad_s, max_rad_s]
 
         # RGBD camera — front-centre of chassis, 10° downward tilt
-        # xyaxes = [cam_X_in_body, cam_Y_in_body]
-        #   cam X (right in image)  = body -Y
-        #   cam Y (up in image)     = body Z tilted 10° toward forward
-        _tilt = math.radians(10.0)
+        # quat [w,x,y,z]: X_cam=-Y_body (right), optical axis=+X_body tilted 10° down
         cam          = base.add_camera()
         cam.name     = "nav_cam"
         cam.pos      = [0.15, 0.0, 0.06]
-        cam.xyaxes   = [0.0, -1.0, 0.0,
-                        -math.sin(_tilt), 0.0, math.cos(_tilt)]
+        cam.quat     = [0.541675, 0.454519, -0.454519, -0.541675]
         cam.fovy     = 60.0
 
         # Home keyframe

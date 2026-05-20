@@ -226,12 +226,12 @@ class ObjectDetector:
     # ── internals ─────────────────────────────────────────────────────────────
 
     def _require_model(self) -> None:
-        if _ultralytics is None:
-            raise ImportError(
-                "ultralytics is required for ObjectDetector inference. "
-                "Install with: pip install ultralytics"
-            )
         if self._model is None:
+            if _ultralytics is None:
+                raise ImportError(
+                    "ultralytics is required for ObjectDetector inference. "
+                    "Install with: pip install ultralytics"
+                )
             raise RuntimeError(
                 f"YOLO model failed to load from '{self.cfg.weights_path}'. "
                 "Check that the path exists or that the base model name is valid."

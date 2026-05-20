@@ -126,7 +126,7 @@ class RGBDFrame:
         z = self.depth[mask].astype(np.float32)
         x = (uu[mask] - cx) * z / fx
         y = (vv[mask] - cy) * z / fy
-        return np.stack([x, y, z], axis=1)
+        return np.stack([x, y, z], axis=1).astype(np.float32)
 
     @property
     def shape(self) -> tuple[int, int]:
