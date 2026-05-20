@@ -72,6 +72,10 @@ class TrackerConfig:
     # Maximum translation per frame before we assume a bad estimate
     max_delta_t:   float = 0.05  # metres — tight cap prevents runaway drift
 
+    # Stillness detection — skip pose update when camera isn't moving
+    still_flow_px: float = 1.5   # mean feature displacement (pixels) below = still
+    still_rot_deg: float = 0.3   # max rotation (degrees) below = still
+
 
 @dataclass
 class TrackResult:
@@ -149,6 +153,18 @@ class CameraTracker:
         prev_good = self._prev_pts[ok]
         curr_good = curr_pts[ok]
 
+        # Stillness detection — if features barely moved, camera is still → skip update
+        flow_mag = float(np.linalg.norm(curr_good - prev_good, axis=-1).mean())
+        if flow_mag < self.cfg.still_flow_px:
+            self._prev_gray = gray
+            self._prev_pts  = curr_good.reshape(-1, 1, 2)
+            return TrackResult(
+                pose       = self._pose.copy(),
+                n_features = int(ok.sum()),
+                status     = "still",
+                delta_t    = np.zeros(3),
+            )
+
         # Essential matrix + RANSAC
         E, inliers = cv2.findEssentialMat(
             curr_good, prev_good, self._K,
@@ -171,6 +187,20 @@ class CameraTracker:
             self._K,
         )
         t = t.ravel()   # (3,)
+
+        # If rotation is also tiny, treat as still
+        angle_deg = float(np.degrees(np.arccos(
+            np.clip((np.trace(R) - 1) / 2, -1, 1)
+        )))
+        if angle_deg < self.cfg.still_rot_deg:
+            self._prev_gray = gray
+            self._prev_pts  = curr_good[inliers].reshape(-1, 1, 2)
+            return TrackResult(
+                pose       = self._pose.copy(),
+                n_features = int(inliers.sum()),
+                status     = "still",
+                delta_t    = np.zeros(3),
+            )
 
         # Scale translation using depth at tracked feature locations
         scale = self._estimate_scale(prev_good[inliers], depth_norm)
