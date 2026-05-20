@@ -75,7 +75,7 @@ class SACConfig:
     ent_coef:               str   = "auto"
     target_entropy:         str   = "auto"
     net_arch:               tuple = (256, 256)
-    use_her:                bool  = True
+    use_her:                bool  = False   # requires Dict obs space (GoalEnv wrapper)
     her_n_sampled_goals:    int   = 4
     her_goal_selection:     str   = "future"   # "final", "episode", "future"
 
@@ -148,12 +148,19 @@ class GraspSACTrainer:
 
         her_kwargs = {}
         replay_buffer_class = None
-        if self.cfg.use_her:
+        from gymnasium import spaces as _spaces
+        obs_is_dict = isinstance(env.observation_space, _spaces.Dict)
+        if self.cfg.use_her and obs_is_dict:
             replay_buffer_class = HerReplayBuffer
             her_kwargs = {
-                "n_sampled_goal":       self.cfg.her_n_sampled_goals,
+                "n_sampled_goal":          self.cfg.her_n_sampled_goals,
                 "goal_selection_strategy": self.cfg.her_goal_selection,
             }
+        elif self.cfg.use_her and not obs_is_dict:
+            log.warning(
+                "HER requested but env uses a flat Box obs space — "
+                "falling back to plain SAC. Wrap env as GoalEnv to enable HER."
+            )
 
         self._model = SAC(
             policy               = "MlpPolicy",
@@ -203,10 +210,9 @@ class GraspSACTrainer:
         )
         t0 = time.time()
         self._model.learn(
-            total_timesteps  = self.total_steps,
-            callback         = callbacks,
-            reset_num_timesteps= resume_path is None,
-            progress_bar     = True,
+            total_timesteps     = self.total_steps,
+            callback            = callbacks,
+            reset_num_timesteps = resume_path is None,
         )
         elapsed = time.time() - t0
         log.info("Training complete in %.1f s", elapsed)
@@ -298,6 +304,8 @@ def _parse() -> argparse.Namespace:
     p.add_argument("--batch-size",    type=int,   default=256)
     p.add_argument("--no-her",        action="store_true",
                    help="Disable HER (train plain SAC)")
+    p.add_argument("--no-wandb",      action="store_true",
+                   help="Disable W&B logging entirely")
     p.add_argument("--wandb-project", type=str,   default=None)
     p.add_argument("--wandb-entity",  type=str,   default=None)
     p.add_argument("--wandb-tags",    type=str,   nargs="*", default=[])
@@ -312,7 +320,7 @@ def main() -> None:
     args = _parse()
 
     wandb_cfg = None
-    if args.wandb_project:
+    if not args.no_wandb and args.wandb_project:
         try:
             import wandb
             wandb.init(
@@ -329,7 +337,7 @@ def main() -> None:
         learning_rate = args.lr,
         buffer_size   = args.buffer_size,
         batch_size    = args.batch_size,
-        use_her       = not args.no_her,
+        use_her       = False,   # HER needs GoalEnv (Dict obs) — plain SAC for now
     )
 
     trainer = GraspSACTrainer(
