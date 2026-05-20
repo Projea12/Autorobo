@@ -62,15 +62,15 @@ class TrackerConfig:
     ransac_thresh: float = 1.0   # pixels
 
     # Depth-based scale estimation
-    depth_scale:   float = 3.0   # multiply normalised depth to get rough metres
+    depth_scale:   float = 0.08  # conservative: keeps per-frame movement small
     depth_min:     float = 0.05
     depth_max:     float = 0.95
 
     # Pose smoothing (exponential moving average on translation)
-    smooth_alpha:  float = 0.5   # 0 = frozen, 1 = raw
+    smooth_alpha:  float = 0.3   # lower = smoother / more lag
 
     # Maximum translation per frame before we assume a bad estimate
-    max_delta_t:   float = 0.3   # metres
+    max_delta_t:   float = 0.05  # metres — tight cap prevents runaway drift
 
 
 @dataclass

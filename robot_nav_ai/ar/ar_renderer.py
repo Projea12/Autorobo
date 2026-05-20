@@ -149,7 +149,8 @@ class ARRenderer:
         # Project robot world position onto screen
         u, v, depth_z = self._project(camera_pose)
 
-        if depth_z <= 0.05:          # robot is behind or too close
+        print(f"[ar] project → screen=({u},{v})  depth={depth_z:.2f}m")
+        if depth_z <= 0.05:
             return frame_bgr
 
         # Scale sprite so robot occupies correct pixel height
@@ -177,11 +178,15 @@ class ARRenderer:
         R, t = pose[:3, :3], pose[:3, 3]
         p_cam = R @ self.cfg.robot_world_pos + t
         z = float(p_cam[2])
-        if z <= 0:
-            return 0, 0, z
-        K = self.cfg.intrinsics
-        u = int(K.fx * p_cam[0] / z + K.cx)
-        v = int(K.fy * p_cam[1] / z + K.cy)
+        if z <= 0.1:
+            z = 0.1   # clamp behind-camera to near plane — keeps robot visible
+        K  = self.cfg.intrinsics
+        u  = int(K.fx * p_cam[0] / z + K.cx)
+        v  = int(K.fy * p_cam[1] / z + K.cy)
+        # Clamp to frame so robot never fully disappears
+        h, w = self.cfg.render_height, self.cfg.render_width
+        u = int(np.clip(u, w // 6, w * 5 // 6))
+        v = int(np.clip(v, h // 3, h - 20))
         return u, v, z
 
     def _get_sprite(
@@ -278,7 +283,7 @@ class ARRenderer:
 # ── entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
-    sys.path.insert(0, str(ROOT.parent))
+    sys.path.insert(0, str(ROOT))
 
     parser = argparse.ArgumentParser(
         description="Autorobo AR renderer — robot overlaid on webcam"
