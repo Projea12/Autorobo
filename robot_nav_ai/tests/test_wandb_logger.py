@@ -105,13 +105,13 @@ class TestDisabledMode:
 class TestWandbUnavailable:
     def test_init_returns_none_when_import_fails(self):
         lb = _logger()
-        with patch.dict("sys.modules", {"wandb": None}):
+        with patch("agent.wandb_logger.wandb", None):
             result = lb.init("run", {})
         assert result is None
 
     def test_enabled_false_when_import_fails(self):
         lb = _logger()
-        with patch.dict("sys.modules", {"wandb": None}):
+        with patch("agent.wandb_logger.wandb", None):
             lb.init("run", {})
         assert lb.enabled is False
 

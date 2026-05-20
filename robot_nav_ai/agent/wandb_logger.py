@@ -46,6 +46,12 @@ from __future__ import annotations
 import dataclasses
 from typing import Any, Dict, Optional
 
+# Module-level import so tests can patch `agent.wandb_logger.wandb`.
+try:
+    import wandb  # type: ignore
+except ImportError:
+    wandb = None  # type: ignore
+
 
 # ── W&B configuration ─────────────────────────────────────────────────────────
 
@@ -111,9 +117,7 @@ class WandbLogger:
         if self._cfg.mode == "disabled":
             return None
 
-        try:
-            import wandb
-        except ImportError:
+        if wandb is None:
             print("[wandb_logger] wandb not installed — W&B logging disabled.")
             return None
 
@@ -143,7 +147,6 @@ class WandbLogger:
         if not self._enabled or self._run is None:
             return
         try:
-            import wandb
             self._run.log(metrics, step=step)
         except Exception:
             pass
