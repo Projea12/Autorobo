@@ -48,21 +48,21 @@ class ARConfig:
     intrinsics:    CameraIntrinsics = field(default_factory=CameraIntrinsics)
 
     # Where the robot stands in the AR world (OpenCV world frame, metres)
-    # x=0 centre, y=1.2 below camera (floor level), z=1.2 in front
+    # x=0 centre, y=1.6 below camera (floor level), z=2.5 in front
     robot_world_pos: np.ndarray = field(
-        default_factory=lambda: np.array([0.0, 1.2, 1.2])
+        default_factory=lambda: np.array([0.0, 1.6, 2.5])
     )
 
-    # Virtual camera for robot sprite
+    # Virtual camera for robot sprite (MuJoCo world: Z-up, so z=0.35 = robot centre)
     sprite_lookat:    np.ndarray = field(
-        default_factory=lambda: np.array([0.1, 0.35, 0.0])
+        default_factory=lambda: np.array([0.1, 0.0, 0.35])
     )
-    sprite_distance:  float = 2.0
+    sprite_distance:  float = 3.0
     sprite_azimuth:   float = -45.0
-    sprite_elevation: float = -20.0
+    sprite_elevation: float = -25.0
 
     # Rendering
-    robot_height_m:   float = 0.80   # approximate robot height (metres)
+    robot_height_m:   float = 0.55   # controls apparent pixel size in frame
     shadow_opacity:   float = 0.50
     robot_opacity:    float = 0.92   # blend factor for robot pixels
     keyframe:         str   = "home"
@@ -119,7 +119,65 @@ class ARRenderer:
         self._sprite_mask: Optional[np.ndarray] = None
         self._sprite_dirty = True
 
+        # Track last virtual camera angles to avoid redundant re-renders
+        self._last_az  = cfg.sprite_azimuth
+        self._last_el  = cfg.sprite_elevation
+        self._az_thresh = 3.0   # degrees change needed to re-render
+
+        # Physics thread state
+        self._physics_lock   = threading.Lock()
+        self._physics_stop   = threading.Event()
+        self._physics_thread: Optional[threading.Thread] = None
+
         print("[ARRenderer] Ready.")
+
+    def start_physics(self, fps: float = 30.0) -> None:
+        """
+        Start MuJoCo physics in a background thread.
+        Wheels spin idle; arm oscillates gently to show live simulation.
+        """
+        if self._physics_thread and self._physics_thread.is_alive():
+            return
+
+        self._physics_stop.clear()
+        self._physics_thread = threading.Thread(
+            target=self._physics_loop, args=(fps,), daemon=True
+        )
+        self._physics_thread.start()
+        print("[ARRenderer] Physics thread started.")
+
+    def stop_physics(self) -> None:
+        self._physics_stop.set()
+
+    def _physics_loop(self, fps: float) -> None:
+        mj      = self._mj
+        model   = self._model
+        dt      = 1.0 / fps
+        t_sim   = 0.0
+
+        # ctrl indices: [wheel_left, wheel_right, joint1..6, finger_left, finger_right]
+        # Slow idle wheel spin
+        wheel_speed = 0.4   # rad/s
+
+        while not self._physics_stop.is_set():
+            t0 = time.perf_counter()
+
+            with self._physics_lock:
+                # Wheel spin
+                self._data.ctrl[0] =  wheel_speed
+                self._data.ctrl[1] = -wheel_speed
+
+                # Gentle arm oscillation on joint4 (wrist)
+                self._data.ctrl[6] = 0.25 * np.sin(t_sim * 0.8)
+
+                mj.mj_step(model, self._data)
+                t_sim += model.opt.timestep
+
+            self._sprite_dirty = True
+
+            elapsed = time.perf_counter() - t0
+            sleep   = max(0.0, dt - elapsed)
+            time.sleep(sleep)
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -146,10 +204,12 @@ class ARRenderer:
         if camera_pose is None:
             camera_pose = np.eye(4)
 
+        # Update virtual camera angle to match real camera rotation
+        self._update_sprite_camera(camera_pose)
+
         # Project robot world position onto screen
         u, v, depth_z = self._project(camera_pose)
 
-        print(f"[ar] project → screen=({u},{v})  depth={depth_z:.2f}m")
         if depth_z <= 0.05:
             return frame_bgr
 
@@ -159,7 +219,8 @@ class ARRenderer:
         sprite_h_px = int(K.fy * cfg.robot_height_m / depth_z)
         sprite_h_px = max(40, min(sprite_h_px, frame_bgr.shape[0]))
 
-        rgb, mask = self._get_sprite(sprite_h_px)
+        with self._physics_lock:
+            rgb, mask = self._get_sprite(sprite_h_px)
 
         out = frame_bgr.copy()
         self._draw_shadow(out, u, v, rgb.shape[1])
@@ -167,9 +228,68 @@ class ARRenderer:
         return out
 
     def close(self) -> None:
+        self.stop_physics()
         self._renderer.close()
 
     # ── internals ─────────────────────────────────────────────────────────────
+
+    def _set_frustum(self) -> None:
+        """
+        Override the MuJoCo scene camera frustum to match real camera intrinsics.
+        Call this after every update_scene() and before render().
+        This gives true foreshortening: steep angles squash the robot correctly.
+        """
+        K    = self.cfg.intrinsics
+        h, w = self.cfg.render_height, self.cfg.render_width
+        near, far = 0.05, 50.0
+        cam  = self._renderer.scene.camera[0]
+        cam.frustum_near   = near
+        cam.frustum_far    = far
+        # Map pixel principal point to frustum planes at near distance
+        cam.frustum_bottom = -near * K.cy / K.fy
+        cam.frustum_top    =  near * (h - K.cy) / K.fy
+        cam.frustum_width  =  near * w / K.fx
+        cam.frustum_center =  near * (w / 2 - K.cx) / K.fx   # ≈ 0 for centred lens
+
+    def _update_sprite_camera(self, pose: np.ndarray) -> None:
+        """
+        Derive virtual camera azimuth/elevation AND distance from the real
+        camera's pose so the robot sprite shows the correct face at the correct
+        perspective scale.
+
+        pose : world-to-camera 4×4 (OpenCV convention, Y-down, Z-forward)
+        """
+        R, t = pose[:3, :3], pose[:3, 3]
+
+        # Actual distance from real camera to robot in world space
+        p_robot_cam = R @ self.cfg.robot_world_pos + t
+        dist = float(np.linalg.norm(p_robot_cam))
+        dist = max(0.5, min(dist, 5.0))
+
+        # Camera forward direction in world (OpenCV: +Z is forward)
+        fwd = R.T @ np.array([0.0, 0.0, 1.0])
+
+        # Yaw (horizontal rotation) and pitch (vertical tilt) from world forward
+        yaw_rad   = np.arctan2(fwd[0], fwd[2])
+        pitch_rad = np.arctan2(-fwd[1], np.sqrt(fwd[0] ** 2 + fwd[2] ** 2))
+
+        # Virtual cam rotates opposite to real camera so the robot faces the viewer
+        new_az   = self.cfg.sprite_azimuth - float(np.degrees(yaw_rad))
+        new_el   = self.cfg.sprite_elevation + float(np.degrees(pitch_rad))
+        new_dist = dist
+
+        changed = (
+            abs(new_az   - self._last_az)  > self._az_thresh or
+            abs(new_el   - self._last_el)  > self._az_thresh or
+            abs(new_dist - self._sprite_cam.distance) > 0.1
+        )
+        if changed:
+            self._sprite_cam.azimuth   = new_az
+            self._sprite_cam.elevation = new_el
+            self._sprite_cam.distance  = new_dist
+            self._last_az  = new_az
+            self._last_el  = new_el
+            self._sprite_dirty = True
 
     def _project(
         self, pose: np.ndarray
@@ -185,8 +305,8 @@ class ARRenderer:
         v  = int(K.fy * p_cam[1] / z + K.cy)
         # Clamp to frame so robot never fully disappears
         h, w = self.cfg.render_height, self.cfg.render_width
-        u = int(np.clip(u, w // 5, w * 4 // 5))
-        v = int(np.clip(v, h // 2, h - 10))   # always in lower half = on the floor
+        u = int(np.clip(u, w // 6, w * 5 // 6))
+        v = int(np.clip(v, h // 3, h - 10))   # lower 2/3 = floor region
         return u, v, z
 
     def _get_sprite(
@@ -213,12 +333,14 @@ class ARRenderer:
         self._renderer.update_scene(
             self._data, camera=self._sprite_cam, scene_option=self._opt
         )
+        self._set_frustum()                    # match real camera intrinsics
         rgb = self._renderer.render().copy()   # H×W×3 uint8
 
         self._renderer.enable_depth_rendering()
         self._renderer.update_scene(
             self._data, camera=self._sprite_cam, scene_option=self._opt
         )
+        self._set_frustum()
         depth = self._renderer.render().copy()
         self._renderer.disable_depth_rendering()
 
@@ -236,8 +358,8 @@ class ARRenderer:
             mask = mask[r0:r1, c0:c1]
 
         bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-        # Boost brightness to match typical indoor webcam exposure
-        bgr = cv2.convertScaleAbs(bgr, alpha=1.6, beta=30)
+        # Boost brightness to match indoor webcam exposure
+        bgr = cv2.convertScaleAbs(bgr, alpha=2.2, beta=50)
         self._sprite_rgb  = bgr
         self._sprite_mask = mask
         self._sprite_dirty = False
@@ -302,6 +424,7 @@ def main() -> None:
     estimator = DepthEstimator(depth_cfg)
     tracker   = CameraTracker()
     renderer  = ARRenderer()
+    renderer.start_physics()
 
     if args.no_preview:
         print("ARRenderer ready.")
