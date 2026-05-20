@@ -99,7 +99,7 @@ class FloorDetector:
         if len(pts) < 50:
             return FloorResult(found=False, mask=np.zeros((h, w), bool))
 
-        normal, d, inlier_mask = self._ransac(pts)
+        normal, d, inlier_mask = self._ransac(pts, image_height=h)
 
         if normal is None:
             return FloorResult(found=False, mask=np.zeros((h, w), bool))
@@ -129,22 +129,25 @@ class FloorDetector:
         return dirs  # H×W×3
 
     def _backproject(self, depth: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Sample a subset of pixels and back-project to 3D."""
+        """Sample bottom 60% of rows only — floor is never at the top of frame."""
         cfg = self.cfg
-        s = cfg.downsample
-        depth_s  = depth[::s, ::s]
-        dirs_s   = self._pixel_dirs[::s, ::s]  # H'×W'×3
+        h   = depth.shape[0]
+        row_start = int(h * 0.40)   # skip top 40%
 
-        mask = (depth_s > cfg.depth_min) & (depth_s < cfg.depth_max)
+        s        = cfg.downsample
+        depth_s  = depth[row_start::s, ::s]
+        dirs_s   = self._pixel_dirs[row_start::s, ::s]
+
+        mask       = (depth_s > cfg.depth_min) & (depth_s < cfg.depth_max)
         flat_depth = depth_s[mask]
-        flat_dirs  = dirs_s[mask]               # N×3
+        flat_dirs  = dirs_s[mask]
 
-        pts = flat_dirs * flat_depth[:, None]   # scale rays by depth
+        pts = flat_dirs * flat_depth[:, None]
         idx = np.where(mask)
         return pts, idx
 
     def _ransac(
-        self, pts: np.ndarray
+        self, pts: np.ndarray, image_height: int = 480
     ) -> Tuple[Optional[np.ndarray], float, np.ndarray]:
         """RANSAC plane fitting. Returns (normal, d, inlier_bool_array)."""
         cfg = self.cfg
@@ -154,14 +157,17 @@ class FloorDetector:
         best_inliers    = np.zeros(n, bool)
         best_count      = 0
 
+        # Points are sampled from bottom 60% of frame; their Y ray coords reflect that.
+        # Floor centroid in camera Y must be positive (lower half of image = higher Y).
+        # We use the median Y of inliers as a proxy: must be > 0 (below image centre).
+        mid_y_cam = 0.0   # camera-space Y at image centre row (after subtracting cy/fy)
+
         rng = np.random.default_rng(42)
 
         for _ in range(cfg.ransac_iters):
-            # Sample 3 random points
             idx = rng.choice(n, 3, replace=False)
             p0, p1, p2 = pts[idx]
 
-            # Plane normal from cross product
             v1 = p1 - p0
             v2 = p2 - p0
             normal = np.cross(v1, v2)
@@ -171,17 +177,23 @@ class FloorDetector:
             normal = normal / norm_len
             d = -float(normal @ p0)
 
-            # Count inliers
-            dist = np.abs(pts @ normal + d)
-            inliers = dist < cfg.inlier_thresh
-
-            # Prefer planes whose normal points roughly upward (Y axis in cam coords)
-            # In OpenCV camera frame: Y points down, so floor normal ≈ (0, -1, 0)
-            # We accept |normal[1]| > threshold (horizontal plane)
+            # Must be a roughly horizontal plane
             if abs(normal[1]) < cfg.normal_up_thresh:
                 continue
 
-            count = inliers.sum()
+            dist    = np.abs(pts @ normal + d)
+            inliers = dist < cfg.inlier_thresh
+            count   = inliers.sum()
+
+            if count == 0:
+                continue
+
+            # Reject if inlier centroid is above the image midpoint in camera Y.
+            # A face/wall centroid sits near Y≈0 or negative; floor centroid is positive Y.
+            centroid_y = pts[inliers, 1].mean()
+            if centroid_y <= mid_y_cam:
+                continue
+
             if count > best_count:
                 best_count   = count
                 best_normal  = normal.copy()
@@ -191,16 +203,15 @@ class FloorDetector:
         if best_normal is None:
             return None, 0.0, np.zeros(n, bool)
 
-        inlier_frac = best_count / n
-        if inlier_frac < cfg.min_inlier_frac:
+        if best_count / n < cfg.min_inlier_frac:
             return None, 0.0, best_inliers
 
         # Refit on all inliers for stability
-        inlier_pts = pts[best_inliers]
-        centroid   = inlier_pts.mean(axis=0)
-        _, _, Vt   = np.linalg.svd(inlier_pts - centroid)
+        inlier_pts     = pts[best_inliers]
+        centroid       = inlier_pts.mean(axis=0)
+        _, _, Vt       = np.linalg.svd(inlier_pts - centroid)
         refined_normal = Vt[-1]
-        if refined_normal[1] > 0:          # ensure normal points upward (−Y cam)
+        if refined_normal[1] > 0:
             refined_normal = -refined_normal
         refined_d = float(-refined_normal @ centroid)
 
@@ -264,17 +275,46 @@ def main() -> None:
         print("FloorDetector ready.")
         return
 
-    estimator.open_camera()
-    interval   = 1.0 / cfg.target_fps
-    last_depth = np.zeros((cfg.frame_height, cfg.frame_width), np.float32)
-    last_result: FloorResult = FloorResult(
-        found=False,
-        mask=np.zeros((cfg.frame_height, cfg.frame_width), bool),
-    )
-    last_time   = 0.0
-    fps_display = 0.0
+    import threading
 
-    print("\n[FloorDetector] Live preview — green = detected floor.  Q to quit.\n")
+    estimator.open_camera()
+
+    h, w = cfg.frame_height, cfg.frame_width
+    last_depth  = np.zeros((h, w), np.float32)
+    last_result: FloorResult = FloorResult(found=False, mask=np.zeros((h, w), bool))
+    fps_display = 0.0
+    lock        = threading.Lock()
+    latest_frame: list = [None]   # shared between threads
+
+    def inference_loop() -> None:
+        nonlocal last_depth, last_result, fps_display
+        while not stop_event.is_set():
+            with lock:
+                frame = latest_frame[0]
+            if frame is None:
+                time.sleep(0.01)
+                continue
+            t0     = time.perf_counter()
+            depth  = estimator.estimate(frame)
+            result = detector.detect(depth)
+            elapsed = time.perf_counter() - t0
+
+            with lock:
+                last_depth  = depth
+                last_result = result
+                fps_display = 1.0 / elapsed if elapsed > 0 else 0.0
+
+            status = ("FLOOR DETECTED" if result.found else "no floor")
+            inliers = f"  inliers={result.inlier_frac:.0%}" if result.found else ""
+            print(f"[floor] {status}{inliers}  |  {fps_display:.1f} fps  "
+                  f"({elapsed*1000:.0f} ms)")
+
+    stop_event = threading.Event()
+    worker     = threading.Thread(target=inference_loop, daemon=True)
+    worker.start()
+
+    print("\n[FloorDetector] Live preview — green = detected floor.")
+    print("Watch the terminal for detection results.  Q to quit.\n")
 
     try:
         while True:
@@ -282,24 +322,17 @@ def main() -> None:
             if frame is None:
                 break
 
-            now = time.perf_counter()
-            if now - last_time >= interval:
-                t0          = time.perf_counter()
-                last_depth  = estimator.estimate(frame)
-                last_result = detector.detect(last_depth)
-                elapsed     = time.perf_counter() - t0
-                fps_display = 1.0 / elapsed if elapsed > 0 else 0.0
-                last_time   = now
+            with lock:
+                latest_frame[0] = frame.copy()
+                depth   = last_depth.copy()
+                result  = last_result
+                fps     = fps_display
 
-            # Depth colourised
-            depth_u8    = (last_depth * 255).astype(np.uint8)
+            depth_u8    = (depth * 255).astype(np.uint8)
             depth_color = cv2.applyColorMap(depth_u8, cv2.COLORMAP_INFERNO)
+            floor_frame = overlay_floor(frame, result)
 
-            # Floor overlay on webcam frame
-            floor_frame = overlay_floor(frame, last_result)
-
-            # FPS
-            fps_label = f"FPS: {fps_display:.1f}  |  Q=quit"
+            fps_label = f"FPS: {fps:.1f}  |  Q=quit"
             cv2.putText(floor_frame, fps_label, (10, 50),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.50, (200, 200, 200), 1, cv2.LINE_AA)
             cv2.putText(depth_color, fps_label, (10, 25),
@@ -312,6 +345,7 @@ def main() -> None:
                 break
 
     finally:
+        stop_event.set()
         estimator.close_camera()
         cv2.destroyAllWindows()
         print("[FloorDetector] Stopped.")
