@@ -15,12 +15,15 @@ Training curriculum
 Checkpoints
 ───────────
   Saved every save_interval environment steps.
-  Uses the CheckpointManager from agent/checkpoint.py (rolling 5 + best slot).
+  Rolling keep-last-5 + best slot.  The W&B run ID is stored in the
+  checkpoint so that --resume continues the same W&B run.
 
 Logging
 ───────
-  Progress printed to stdout every log_interval steps.
-  TensorBoard SummaryWriter written to runs/<run_name>/ if available.
+  stdout     : printed every log_interval steps
+  TensorBoard: written to runs/<run_name>/ if torch.utils.tensorboard available
+  W&B        : full run with all hyperparameters if wandb is installed
+               Pass --no-wandb to disable, --wandb-project to set project name.
 """
 
 from __future__ import annotations
@@ -44,6 +47,7 @@ from env.navigation_env import NavigationEnv
 from env.episode_reset import GoalConfig
 from env.nav_reward import RewardConfig
 from agent.ppo import PPOConfig, make_ppo_agent
+from agent.wandb_logger import WandbConfig, WandbLogger, build_hparams
 
 
 # ── training configuration ────────────────────────────────────────────────────
@@ -70,6 +74,9 @@ class NavTrainConfig:
     log_interval:  int   = 10_000    # print every N env steps
     save_interval: int   = 100_000   # checkpoint every N env steps
     keep_last:     int   = 5
+
+    # --- W&B ---
+    wandb: WandbConfig = field(default_factory=WandbConfig)
 
 
 # ── reward config for each curriculum stage ───────────────────────────────────
@@ -115,14 +122,22 @@ class _SimpleCheckpointer:
         self._history: list[Path] = []
         self._best_reward: float  = -float("inf")
 
-    def save(self, agent, global_step: int, mean_reward: float) -> None:
+    def save(
+        self,
+        agent,
+        global_step:   int,
+        mean_reward:   float,
+        wandb_run_id:  Optional[str] = None,
+    ) -> None:
         tag  = f"step_{global_step:010d}"
         path = self.dir / f"{tag}.pt"
-        torch.save({
-            "agent":       agent.state_dict(),
-            "global_step": global_step,
-            "mean_reward": mean_reward,
-        }, path)
+        payload = {
+            "agent":        agent.state_dict(),
+            "global_step":  global_step,
+            "mean_reward":  mean_reward,
+            "wandb_run_id": wandb_run_id,
+        }
+        torch.save(payload, path)
         self._history.append(path)
 
         # rolling eviction
@@ -135,11 +150,7 @@ class _SimpleCheckpointer:
         if mean_reward > self._best_reward:
             self._best_reward = mean_reward
             best_path = self.dir / "best.pt"
-            torch.save({
-                "agent":       agent.state_dict(),
-                "global_step": global_step,
-                "mean_reward": mean_reward,
-            }, best_path)
+            torch.save(payload, best_path)
 
         # metadata
         meta = {
@@ -147,6 +158,7 @@ class _SimpleCheckpointer:
             "mean_reward":   mean_reward,
             "best_reward":   self._best_reward,
             "latest_ckpt":   str(path),
+            "wandb_run_id":  wandb_run_id,
         }
         (self.dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
