@@ -1,177 +1,265 @@
 """
-detector.py — YOLOv8 Object Detector (Phase 6)
+perception/detector.py — YOLOv8 object detector for YCB manipulation objects.
 
-Provides real-time object detection on RGB images using YOLOv8.
-Detects YCB objects and general household items relevant to manipulation tasks.
+Wraps Ultralytics YOLOv8 with a stable interface used throughout the
+perception pipeline.  The implementation degrades gracefully when
+ultralytics is not installed: construction succeeds but detect() raises
+a clear ImportError so the rest of the system can still be imported.
 
-The full implementation (Phase 6) will:
-- Load YOLOv8n/s/m checkpoint (configurable via configs/perception/yolo.yaml)
-- Accept BGR or RGB numpy images
-- Return Detection objects with class, confidence, bounding box, and 3D position
-- Support fine-tuning on YCB-Video dataset for domain adaptation
+Typical usage
+─────────────
+    cfg = DetectorConfig(weights_path="models/ycb_yolo.pt", conf_thresh=0.30)
+    det = ObjectDetector(cfg)
 
-Usage:
-    from perception.detector import ObjectDetector
+    frame = env.capture_rgbd()
+    detections = det.detect(frame.rgb)
+    for d in detections:
+        print(d.class_name, d.confidence, d.bbox_xyxy)
 
-    detector = ObjectDetector(cfg.perception.detector)
-    detections = detector.detect(rgb_image)
-    for det in detections:
-        print(det.class_name, det.confidence, det.bbox_xyxy)
+    # batch
+    batch = det.detect_batch([frame1.rgb, frame2.rgb])
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Optional
 
 import numpy as np
 
 log = logging.getLogger(__name__)
 
+# Lazy import — store the module reference at class-construction time so
+# tests can patch perception.detector._ultralytics.
+try:
+    import ultralytics as _ultralytics  # type: ignore
+except ImportError:
+    _ultralytics = None  # type: ignore
+
+
+# ── detection dataclass ───────────────────────────────────────────────────────
 
 @dataclass
 class Detection:
     """
-    Represents a single object detection result.
+    Single object detection result.
 
-    Attributes:
-        class_id: Integer class ID from the detector.
-        class_name: Human-readable class name (e.g. "025_mug").
-        confidence: Detection confidence score in [0.0, 1.0].
-        bbox_xyxy: Bounding box [x1, y1, x2, y2] in pixel coordinates.
-        bbox_xywh: Bounding box [cx, cy, w, h] in pixel coordinates.
-        mask: Optional binary segmentation mask (H, W) bool array.
-        position_3d: Optional 3D position (x, y, z) in robot base frame (metres).
-        track_id: Optional tracking ID for multi-frame tracking.
+    Fields
+    ------
+    class_id    : integer class index (matches dataset.yaml ordering)
+    class_name  : human-readable name, e.g. "025_mug"
+    confidence  : score in [0, 1]
+    bbox_xyxy   : (4,) float32 pixel coords [x1, y1, x2, y2]
+    bbox_xywh   : (4,) float32 pixel coords [cx, cy, w, h]
+    mask        : (H, W) bool segmentation mask, or None
+    position_3d : (3,) float32 position in robot base frame (m), or None
+    track_id    : multi-frame track ID, or None
     """
-    class_id: int
-    class_name: str
-    confidence: float
-    bbox_xyxy: np.ndarray           # shape (4,), dtype float32
-    bbox_xywh: np.ndarray           # shape (4,), dtype float32
-    mask: np.ndarray | None = None  # shape (H, W), dtype bool
-    position_3d: np.ndarray | None = None  # shape (3,), dtype float32
-    track_id: int | None = None
+    class_id:    int
+    class_name:  str
+    confidence:  float
+    bbox_xyxy:   np.ndarray              # (4,) float32
+    bbox_xywh:   np.ndarray              # (4,) float32
+    mask:        Optional[np.ndarray] = None   # (H, W) bool
+    position_3d: Optional[np.ndarray] = None   # (3,) float32
+    track_id:    Optional[int]        = None
 
     def __repr__(self) -> str:
-        pos = f" pos={self.position_3d}" if self.position_3d is not None else ""
-        return (
-            f"Detection({self.class_name}, conf={self.confidence:.2f}, "
-            f"bbox={self.bbox_xyxy.tolist()}{pos})"
-        )
+        pos = f" pos={self.position_3d.tolist()}" if self.position_3d is not None else ""
+        return (f"Detection({self.class_name!r}, conf={self.confidence:.2f}, "
+                f"bbox={self.bbox_xyxy.tolist()}{pos})")
 
+    @property
+    def area(self) -> float:
+        """Bounding box area in pixels²."""
+        return float(self.bbox_xywh[2] * self.bbox_xywh[3])
+
+    @property
+    def centre(self) -> np.ndarray:
+        """Bounding box centre (cx, cy) in pixels."""
+        return self.bbox_xywh[:2].copy()
+
+
+# ── detector configuration ────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class DetectorConfig:
+    """
+    Configuration for ObjectDetector.
+
+    weights_path   : path to a fine-tuned .pt file, or a base model name
+                     like "yolov8n.pt" (downloaded automatically on first use)
+    conf_thresh    : minimum confidence to keep a detection [0, 1]
+    iou_thresh     : NMS IoU threshold [0, 1]
+    device         : "cpu", "cuda", "cuda:0", "mps", or "" (auto)
+    half           : use FP16 inference (GPU only)
+    imgsz          : inference image size (pixels); images are letterboxed
+    max_det        : maximum detections per image
+    """
+    weights_path: str   = "yolov8n.pt"
+    conf_thresh:  float = 0.25
+    iou_thresh:   float = 0.45
+    device:       str   = ""      # empty string → auto (CUDA if available)
+    half:         bool  = False
+    imgsz:        int   = 640
+    max_det:      int   = 100
+
+
+# ── detector ──────────────────────────────────────────────────────────────────
 
 class ObjectDetector:
     """
-    YOLOv8-based object detector for tabletop manipulation.
+    YOLOv8-based detector for YCB manipulation objects.
 
-    Wraps the Ultralytics YOLOv8 model with a stable interface for the
-    manipulation pipeline. Handles model loading, inference, and
-    post-processing (NMS, class filtering, confidence thresholding).
+    Parameters
+    ----------
+    cfg : DetectorConfig
 
-    Configuration via DictConfig (from configs/perception/yolo.yaml):
-        model_path: path to YOLOv8 .pt checkpoint
-        confidence_threshold: minimum detection confidence
-        iou_threshold: NMS IoU threshold
-        device: "cpu", "cuda:0", or "mps"
-        classes: list of class names to detect (None = all)
+    Raises
+    ------
+    ImportError  : at detect() time if ultralytics is not installed
+    FileNotFoundError : if weights_path does not exist (ultralytics handles this
+                        by downloading the base model, so only custom paths fail)
     """
 
-    def __init__(self, cfg: Any) -> None:
-        """
-        Initialise and load the YOLOv8 model.
-
-        Args:
-            cfg: DictConfig with detector settings (from perception.detector).
-
-        TODO: Phase 6 — implement:
-            from ultralytics import YOLO
-            model_path = cfg.fine_tuned_path if cfg.fine_tuned else cfg.model_path
-            self._model = YOLO(model_path)
-            self._model.to(cfg.device)
-            log.info(f"YOLOv8 loaded from {model_path} on {cfg.device}")
-        """
+    def __init__(self, cfg: DetectorConfig = DetectorConfig()) -> None:
         self.cfg = cfg
-        self._model = None  # ultralytics.YOLO — loaded in Phase 6
+        self._model = None
         self._class_names: list[str] = []
-        log.info("ObjectDetector created (model not yet loaded — TODO: Phase 6)")
+
+        if _ultralytics is None:
+            log.warning(
+                "ultralytics not installed — ObjectDetector created in stub mode. "
+                "Install with: pip install ultralytics"
+            )
+            return
+
+        try:
+            yolo_cls = _ultralytics.YOLO
+            self._model = yolo_cls(cfg.weights_path)
+            device = cfg.device or None
+            if device:
+                self._model.to(device)
+            if cfg.half and device not in ("cpu", ""):
+                self._model.half()
+            self._class_names = list(self._model.names.values())
+            log.info(
+                "ObjectDetector loaded '%s' — %d classes, device=%s",
+                cfg.weights_path, len(self._class_names), device or "auto",
+            )
+        except Exception as exc:
+            log.error("Failed to load YOLO model: %s", exc)
+            self._model = None
+
+    # ── inference ─────────────────────────────────────────────────────────────
 
     def detect(self, image: np.ndarray) -> list[Detection]:
         """
-        Run object detection on a single RGB image.
+        Detect objects in a single RGB image.
 
-        Args:
-            image: RGB image as np.ndarray of shape (H, W, 3), dtype uint8.
-                Accepts both HWC (standard) and CHW format.
+        Parameters
+        ----------
+        image : (H, W, 3) uint8 RGB.  BGR is also accepted (auto-converted).
 
-        Returns:
-            List of Detection objects, sorted by confidence (descending).
-            Empty list if no objects detected above threshold.
-
-        TODO: Phase 6 — implement:
-            results = self._model.predict(
-                source=image,
-                conf=self.cfg.confidence_threshold,
-                iou=self.cfg.iou_threshold,
-                max_det=self.cfg.max_detections,
-                verbose=False,
-            )
-            detections = []
-            for box in results[0].boxes:
-                det = Detection(
-                    class_id=int(box.cls),
-                    class_name=self._class_names[int(box.cls)],
-                    confidence=float(box.conf),
-                    bbox_xyxy=box.xyxy[0].cpu().numpy(),
-                    bbox_xywh=box.xywh[0].cpu().numpy(),
-                )
-                detections.append(det)
-            return sorted(detections, key=lambda d: d.confidence, reverse=True)
+        Returns
+        -------
+        Detections sorted by confidence descending.  Empty list if none found.
         """
-        if self._model is None:
-            raise RuntimeError(
-                "ObjectDetector model not loaded. "
-                "Call ObjectDetector(cfg) to load the model first. "
-                "TODO: Phase 6 — load model in __init__."
-            )
-        raise NotImplementedError(
-            "TODO: Phase 6 — implement detect() using ultralytics YOLO.predict()."
+        self._require_model()
+        results = self._model.predict(
+            source  = image,
+            conf    = self.cfg.conf_thresh,
+            iou     = self.cfg.iou_thresh,
+            imgsz   = self.cfg.imgsz,
+            max_det = self.cfg.max_det,
+            verbose = False,
         )
+        return self._parse_results(results[0])
 
     def detect_batch(self, images: list[np.ndarray]) -> list[list[Detection]]:
         """
-        Run detection on a batch of images for efficiency.
+        Detect objects in a batch of RGB images (2–4× faster than looping).
 
-        Args:
-            images: List of RGB images, each shape (H, W, 3).
+        Parameters
+        ----------
+        images : list of (H, W, 3) uint8 arrays
 
-        Returns:
-            List of detection lists, one per input image.
-
-        TODO: Phase 6 — use YOLO batch inference for 2-4× speedup:
-            results = self._model.predict(source=images, ...)
+        Returns
+        -------
+        List of detection lists, one per input image.
         """
-        raise NotImplementedError(
-            "TODO: Phase 6 — implement batch detection using YOLO batch inference."
+        self._require_model()
+        if not images:
+            return []
+        results = self._model.predict(
+            source  = images,
+            conf    = self.cfg.conf_thresh,
+            iou     = self.cfg.iou_thresh,
+            imgsz   = self.cfg.imgsz,
+            max_det = self.cfg.max_det,
+            verbose = False,
         )
+        return [self._parse_results(r) for r in results]
 
     def set_device(self, device: str) -> None:
-        """
-        Move the model to a different compute device.
+        """Move the loaded model to a different compute device."""
+        self._require_model()
+        self._model.to(device)
 
-        Args:
-            device: "cpu", "cuda:0", "cuda:1", or "mps".
-
-        TODO: Phase 6 — implement:
-            self._model.to(device)
-            self.cfg.device = device
-        """
-        raise NotImplementedError(
-            f"TODO: Phase 6 — implement set_device({device!r})."
-        )
+    # ── properties ────────────────────────────────────────────────────────────
 
     @property
     def class_names(self) -> list[str]:
-        """Return the list of detectable class names."""
-        return self._class_names
+        """Detectable class name list (reflects the loaded model's names)."""
+        return list(self._class_names)
+
+    @property
+    def n_classes(self) -> int:
+        return len(self._class_names)
+
+    @property
+    def is_loaded(self) -> bool:
+        """True if the YOLO model was loaded successfully."""
+        return self._model is not None
+
+    # ── internals ─────────────────────────────────────────────────────────────
+
+    def _require_model(self) -> None:
+        if _ultralytics is None:
+            raise ImportError(
+                "ultralytics is required for ObjectDetector inference. "
+                "Install with: pip install ultralytics"
+            )
+        if self._model is None:
+            raise RuntimeError(
+                f"YOLO model failed to load from '{self.cfg.weights_path}'. "
+                "Check that the path exists or that the base model name is valid."
+            )
+
+    def _parse_results(self, result) -> list[Detection]:
+        """Convert one ultralytics Results object to Detection list."""
+        detections: list[Detection] = []
+        boxes = result.boxes
+        if boxes is None or len(boxes) == 0:
+            return detections
+
+        xyxy_all  = boxes.xyxy.cpu().numpy().astype(np.float32)
+        xywh_all  = boxes.xywh.cpu().numpy().astype(np.float32)
+        conf_all  = boxes.conf.cpu().numpy().astype(np.float64)
+        cls_all   = boxes.cls.cpu().numpy().astype(np.int32)
+
+        for i in range(len(boxes)):
+            cid  = int(cls_all[i])
+            name = (self._class_names[cid]
+                    if cid < len(self._class_names) else str(cid))
+            detections.append(Detection(
+                class_id   = cid,
+                class_name = name,
+                confidence = float(conf_all[i]),
+                bbox_xyxy  = xyxy_all[i],
+                bbox_xywh  = xywh_all[i],
+            ))
+
+        detections.sort(key=lambda d: d.confidence, reverse=True)
+        return detections

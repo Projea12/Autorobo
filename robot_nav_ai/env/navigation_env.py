@@ -105,7 +105,8 @@ class NavigationEnv(gym.Env):
 
         self._model = self._build_model()
         self._data  = mujoco.MjData(self._model)
-        self._renderer: Optional[mujoco.Renderer] = None
+        self._renderer:  Optional[mujoco.Renderer] = None
+        self._rgbd_cam:  Optional[Any]             = None   # RGBDCamera, lazy
 
         self._cache_indices()
 
@@ -205,7 +206,28 @@ class NavigationEnv(gym.Env):
         self._renderer.update_scene(self._data)
         return self._renderer.render().copy()
 
+    def capture_rgbd(self, cfg=None):
+        """
+        Render one RGB-D frame from the onboard 'nav_cam' camera.
+
+        Parameters
+        ----------
+        cfg : RGBDConfig or None — uses default 640×480 60° fov if None
+
+        Returns
+        -------
+        RGBDFrame with rgb (H,W,3 uint8) and depth (H,W float32 metres).
+        """
+        from perception.rgbd_camera import RGBDCamera, RGBDConfig
+        if self._rgbd_cam is None:
+            self._rgbd_cam = RGBDCamera(cfg or RGBDConfig(), self._model)
+        mujoco.mj_forward(self._model, self._data)
+        return self._rgbd_cam.capture(self._data, step=self._step_count)
+
     def close(self) -> None:
+        if self._rgbd_cam is not None:
+            self._rgbd_cam.close()
+            self._rgbd_cam = None
         if self._renderer is not None:
             self._renderer.close()
             self._renderer = None
@@ -312,6 +334,18 @@ class NavigationEnv(gym.Env):
             act.gainprm   = [20.0] + [0.0] * 9
             act.biasprm   = [0.0, 0.0, -20.0] + [0.0] * 7
             act.ctrlrange = [-max_rad_s, max_rad_s]
+
+        # RGBD camera — front-centre of chassis, 10° downward tilt
+        # xyaxes = [cam_X_in_body, cam_Y_in_body]
+        #   cam X (right in image)  = body -Y
+        #   cam Y (up in image)     = body Z tilted 10° toward forward
+        _tilt = math.radians(10.0)
+        cam          = base.add_camera()
+        cam.name     = "nav_cam"
+        cam.pos      = [0.15, 0.0, 0.06]
+        cam.xyaxes   = [0.0, -1.0, 0.0,
+                        -math.sin(_tilt), 0.0, math.cos(_tilt)]
+        cam.fovy     = 60.0
 
         # Home keyframe
         kf       = spec.add_key()
