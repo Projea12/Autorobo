@@ -209,7 +209,7 @@ class DepthProjector:
         cx_pix = float(np.clip((det.bbox_xyxy[0] + det.bbox_xyxy[2]) / 2.0, 0, W - 1))
         cy_pix = float(np.clip((det.bbox_xyxy[1] + det.bbox_xyxy[3]) / 2.0, 0, H - 1))
         z      = float(frame.depth[int(cy_pix), int(cx_pix)])
-        if z <= 0.0 or not np.isfinite(z):
+        if not (self.cfg.z_min < z < self.cfg.z_max) or not np.isfinite(z):
             z = 0.0
         xyz, std = self._backproject(cx_pix, cy_pix, z, 0.0, frame.K)
         return ProjectionResult(xyz=xyz, std=std,
