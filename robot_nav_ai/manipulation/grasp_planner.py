@@ -10,7 +10,7 @@ Planning includes:
   2. Final grasp descent: lower to grasp contact position
   3. Post-grasp lift: raise the object after closing the gripper
 
-Uses inverse kinematics (IK) to convert Cartesian waypoints to joint angles.
+Uses inverse kinematics to convert Cartesian waypoints to joint angles.
 
 Usage:
     from manipulation.grasp_planner import GraspPlanner
