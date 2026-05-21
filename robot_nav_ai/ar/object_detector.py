@@ -395,16 +395,16 @@ class ObjectDetector:
             ))
         return dets
 
-    def _class_colour(self, label: str) -> Tuple[int, int, int]:
-        if label not in self._colours:
-            # Deterministic colour from label hash
-            h = hash(label) % 256
-            self._colours[label] = tuple(
+    def _track_colour(self, track_id: int) -> Tuple[int, int, int]:
+        """Stable colour per track ID — same object always same colour."""
+        if track_id not in self._colours:
+            h = (track_id * 47) % 180   # spread hues evenly
+            self._colours[track_id] = tuple(
                 int(c) for c in cv2.cvtColor(
-                    np.uint8([[[h, 200, 180]]]), cv2.COLOR_HSV2BGR
+                    np.uint8([[[h, 220, 190]]]), cv2.COLOR_HSV2BGR
                 )[0][0]
             )
-        return self._colours[label]
+        return self._colours[track_id]
 
 
 # ── label helpers ────────────────────────────────────────────────────────────
@@ -431,6 +431,18 @@ _SYNONYMS: dict[str, list] = {
 # Words to strip from natural language commands
 _STRIP = {"pick", "up", "grab", "get", "fetch", "bring", "take",
           "the", "a", "an", "that", "this", "please", "me", "for", "i"}
+
+
+def _iou(a: Tuple[int,int,int,int], b: Tuple[int,int,int,int]) -> float:
+    """Intersection-over-Union of two boxes [x1,y1,x2,y2]."""
+    ix1 = max(a[0], b[0]); iy1 = max(a[1], b[1])
+    ix2 = min(a[2], b[2]); iy2 = min(a[3], b[3])
+    inter = max(0, ix2-ix1) * max(0, iy2-iy1)
+    if inter == 0:
+        return 0.0
+    area_a = (a[2]-a[0]) * (a[3]-a[1])
+    area_b = (b[2]-b[0]) * (b[3]-b[1])
+    return inter / (area_a + area_b - inter)
 
 
 def _extract_object_label(text: str) -> str:
