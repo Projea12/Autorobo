@@ -168,6 +168,8 @@ def main() -> None:
                         help="Disable visual SLAM (faster startup)")
     parser.add_argument("--no-detect", action="store_true",
                         help="Disable object detection")
+    parser.add_argument("--no-depth", action="store_true",
+                        help="Disable 3D localisation (depth estimation)")
     args = parser.parse_args()
 
     video_path = Path(args.video) if Path(args.video).is_absolute() \
@@ -177,6 +179,7 @@ def main() -> None:
     from ar.command_interface import CommandInterface, RobotController, Cmd
     from ar.slam              import VisualSLAM, SLAMConfig
     from ar.object_detector   import ObjectDetector
+    from ar.localiser         import Localiser
 
     # ── open video ────────────────────────────────────────────────────────────
     player = VideoPlayer(str(video_path))
@@ -224,6 +227,15 @@ def main() -> None:
     else:
         detector = None
 
+    # ── 3-D localiser (DepthAnything V2) ─────────────────────────────────────
+    use_depth = use_detect and not args.no_depth
+    if use_depth:
+        localiser = Localiser(every_n=5)
+        localiser.start()
+        print("[video_ar] 3D localiser enabled (DepthAnything V2).")
+    else:
+        localiser = None
+
     # ── command interface ─────────────────────────────────────────────────────
     quit_event   = threading.Event()
     _cur_speed   = [0.0]   # shared mutable for SLAM worker
@@ -265,11 +277,13 @@ def main() -> None:
             if frame is None:
                 break
 
-            # Feed frame to SLAM and detector (non-blocking)
+            # Feed frame to SLAM, detector and localiser (non-blocking)
             if use_slam:
                 slam_worker.update(frame, _cur_speed[0])
             if use_detect and detector is not None:
                 detector.update(frame)
+            if use_depth and localiser is not None:
+                localiser.update(frame)
 
             # Render TidyBot sprite at fixed screen position (lock prevents
             # physics thread corrupting MjData mid-render)

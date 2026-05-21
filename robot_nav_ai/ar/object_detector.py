@@ -63,11 +63,14 @@ class Detection:
     bbox_xyxy:   Tuple[int, int, int, int]   # x1, y1, x2, y2  (pixels)
     centroid_uv: Tuple[int, int]             # (u, v) centre pixel
     track_id:    int = -1                    # assigned by IoUTracker (-1 = untracked)
+    position_3d: Optional[Tuple[float, float, float]] = None  # (X,Y,Z) metres, camera frame
 
     def __str__(self) -> str:
         u, v = self.centroid_uv
         tid  = f" #{self.track_id}" if self.track_id >= 0 else ""
-        return f"{self.label}{tid} {self.confidence:.0%} @ ({u},{v})"
+        xyz  = (f" [{self.position_3d[0]:+.1f},{self.position_3d[1]:+.1f},{self.position_3d[2]:.1f}m]"
+                if self.position_3d is not None else "")
+        return f"{self.label}{tid} {self.confidence:.0%} @ ({u},{v}){xyz}"
 
 
 # ── per-track Kalman filter ───────────────────────────────────────────────────
