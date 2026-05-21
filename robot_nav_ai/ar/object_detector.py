@@ -58,14 +58,100 @@ HOME_CLASSES = [
 
 @dataclass
 class Detection:
-    label:      str
-    confidence: float
-    bbox_xyxy:  Tuple[int, int, int, int]   # x1, y1, x2, y2  (pixels)
+    label:       str
+    confidence:  float
+    bbox_xyxy:   Tuple[int, int, int, int]   # x1, y1, x2, y2  (pixels)
     centroid_uv: Tuple[int, int]             # (u, v) centre pixel
+    track_id:    int = -1                    # assigned by IoUTracker (-1 = untracked)
 
     def __str__(self) -> str:
         u, v = self.centroid_uv
-        return f"{self.label} {self.confidence:.0%} @ ({u},{v})"
+        tid  = f" #{self.track_id}" if self.track_id >= 0 else ""
+        return f"{self.label}{tid} {self.confidence:.0%} @ ({u},{v})"
+
+
+# ── IoU centroid tracker ───────────────────────────────────────────────────────
+
+class IoUTracker:
+    """
+    Assigns stable integer track IDs to detections across frames.
+
+    Algorithm (greedy IoU matching):
+      1. Compute IoU between every new detection and every live track.
+      2. Greedily match highest-IoU pairs (IoU > iou_thresh).
+      3. Matched tracks keep their ID.
+      4. Unmatched new detections get a fresh ID.
+      5. Tracks unseen for max_age frames are removed.
+
+    Same-label constraint: only match detections to tracks of the same class
+    so a bottle never steals a cup's ID.
+    """
+
+    def __init__(self, iou_thresh: float = 0.30, max_age: int = 8) -> None:
+        self._iou_thresh = iou_thresh
+        self._max_age    = max_age
+        self._next_id    = 0
+        # track_id → {bbox, label, age (frames since last seen)}
+        self._tracks: dict[int, dict] = {}
+
+    def update(self, detections: List[Detection]) -> List[Detection]:
+        """Assign / update track IDs. Returns detections with track_id set."""
+        if not detections:
+            # Age out all tracks
+            for tid in list(self._tracks):
+                self._tracks[tid]["age"] += 1
+                if self._tracks[tid]["age"] > self._max_age:
+                    del self._tracks[tid]
+            return []
+
+        live_ids  = list(self._tracks.keys())
+        det_boxes = [d.bbox_xyxy for d in detections]
+        trk_boxes = [self._tracks[t]["bbox"] for t in live_ids]
+
+        # IoU matrix: rows=detections, cols=tracks
+        iou_mat = np.zeros((len(detections), len(live_ids)), dtype=np.float32)
+        for i, db in enumerate(det_boxes):
+            for j, tb in enumerate(trk_boxes):
+                if detections[i].label == self._tracks[live_ids[j]]["label"]:
+                    iou_mat[i, j] = _iou(db, tb)
+
+        matched_det  = set()
+        matched_trk  = set()
+
+        # Greedy: match highest IoU pairs first
+        flat = np.argsort(-iou_mat, axis=None)
+        for idx in flat:
+            i, j = divmod(int(idx), len(live_ids))
+            if iou_mat[i, j] < self._iou_thresh:
+                break
+            if i in matched_det or j in matched_trk:
+                continue
+            tid = live_ids[j]
+            detections[i].track_id = tid
+            self._tracks[tid]["bbox"] = det_boxes[i]
+            self._tracks[tid]["age"]  = 0
+            matched_det.add(i)
+            matched_trk.add(j)
+
+        # New tracks for unmatched detections
+        for i, det in enumerate(detections):
+            if i not in matched_det:
+                det.track_id = self._next_id
+                self._tracks[self._next_id] = {
+                    "bbox":  det.bbox_xyxy,
+                    "label": det.label,
+                    "age":   0,
+                }
+                self._next_id += 1
+
+        # Age out unmatched tracks
+        for j, tid in enumerate(live_ids):
+            if j not in matched_trk:
+                self._tracks[tid]["age"] += 1
+                if self._tracks[tid]["age"] > self._max_age:
+                    del self._tracks[tid]
+
+        return detections
 
 
 # ── Detector ──────────────────────────────────────────────────────────────────
@@ -120,9 +206,10 @@ class ObjectDetector:
         self._stop        = threading.Event()
         self._thread      = threading.Thread(target=self._loop, daemon=True)
 
-        # Colours per class (consistent across frames)
-        self._colours: dict[str, Tuple[int,int,int]] = {}
+        # Colours per track ID (stable colour = stable ID)
+        self._colours: dict[int, Tuple[int,int,int]] = {}
         self._target_label: Optional[str] = None
+        self._tracker = IoUTracker(iou_thresh=0.30, max_age=8)
         print("[detector] Ready.")
 
     # ── public API ────────────────────────────────────────────────────────────
@@ -208,21 +295,22 @@ class ObjectDetector:
                          (det.label == target or target in det.label
                           or det.label in _SYNONYMS.get(target, [])))
 
-            colour    = (0, 255, 80) if is_target else self._class_colour(det.label)
+            colour    = (0, 255, 80) if is_target else self._track_colour(det.track_id)
             thickness = 3            if is_target else 2
             x1, y1, x2, y2 = det.bbox_xyxy
 
-            # Pulsing highlight for target
             if is_target:
-                cv2.rectangle(out, (x1-3, y1-3), (x2+3, y2+3), (0,255,80), 1)
+                cv2.rectangle(out, (x1-3, y1-3), (x2+3, y2+3), (0, 255, 80), 1)
 
             cv2.rectangle(out, (x1, y1), (x2, y2), colour, thickness)
 
-            label_txt = f"{'► ' if is_target else ''}{det.label} {det.confidence:.0%}"
-            (tw, th), _ = cv2.getTextSize(label_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            tid_str   = f"#{det.track_id} " if det.track_id >= 0 else ""
+            label_txt = f"{'► ' if is_target else ''}{tid_str}{det.label} {det.confidence:.0%}"
+            (tw, th), _ = cv2.getTextSize(label_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
             cv2.rectangle(out, (x1, y1-th-6), (x1+tw+4, y1), colour, -1)
             cv2.putText(out, label_txt, (x1+2, y1-4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0) if is_target else (255,255,255),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                        (0, 0, 0) if is_target else (255, 255, 255),
                         1, cv2.LINE_AA)
 
             u, v = det.centroid_uv
@@ -279,6 +367,7 @@ class ObjectDetector:
             elapsed = time.perf_counter() - t0
 
             dets = self._parse(results)
+            dets = self._tracker.update(dets)   # assign stable track IDs
 
             with self._lock:
                 self._detections = dets
