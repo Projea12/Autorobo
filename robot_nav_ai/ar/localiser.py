@@ -2,18 +2,16 @@
 ar/localiser.py — Metric 3D localisation from DepthAnything V2.
 
 Runs DepthAnything V2 Metric-Indoor in a background thread and
-back-projects detection bounding boxes to metric 3D coordinates.
+back-projects detection bounding boxes to metric 3D coordinates in both
+the camera frame and the robot base frame.
 
-Depth sampling
---------------
-For each detected object, depth is sampled from the *inner 50%* of the
-bounding box (shrink each edge by 25%).  This avoids background pixels
-leaking in at box borders, which would bias the estimate upward.
+Pipeline per detection
+----------------------
+1. Sample inner-50% bbox region of the depth map → median depth d (metres)
+2. back_project(u, v, d, K) → (X, Y, Z) in camera frame
+3. T_CAM_TO_BASE((X, Y, Z)_cam) → (X, Y, Z) in TidyBot base frame
 
-Metric model
-------------
-Uses `Depth-Anything-V2-Metric-Indoor-Small-hf` which outputs depth in
-metres directly — no manual scale factor needed.
+See ar/transforms.py for the camera mounting geometry and axis conventions.
 
 Usage
 -----
@@ -40,6 +38,8 @@ from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
+
+from ar.transforms import T_CAM_TO_BASE, RigidTransform
 
 
 # ── inner-box sampling ────────────────────────────────────────────────────────
@@ -153,27 +153,62 @@ class Localiser:
         Z = d
         return (X, Y, Z)
 
+    @staticmethod
+    def to_base_frame(
+        xyz_cam: Tuple[float, float, float],
+        transform: RigidTransform = T_CAM_TO_BASE,
+    ) -> Tuple[float, float, float]:
+        """
+        Convert a camera-frame point to the robot base frame.
+
+        Uses the fixed camera mounting transform (ar/transforms.py):
+            camera at [right=0, forward=0.1m, up=1.2m] on TidyBot.
+
+        Parameters
+        ----------
+        xyz_cam   : (X, Y, Z) in camera frame — from back_project()
+        transform : RigidTransform to use (default T_CAM_TO_BASE)
+
+        Returns
+        -------
+        (X, Y, Z) in TidyBot base frame.
+            X = right (metres),  Y = forward (metres),  Z = up (metres)
+
+        Example
+        -------
+        Object at 1 m directly in front of the camera (optical axis):
+            xyz_cam  = (0.0, 0.0, 1.0)
+            xyz_base = (0.0, 1.1, 1.2)   # Y_base ≈ 1.0 m forward ✓
+        """
+        return transform(xyz_cam)
+
     def localise(
         self,
         detections,
         depth_map: np.ndarray,
         intrinsics,
+        in_base_frame: bool = True,
     ) -> List[Optional[Tuple[float, float, float]]]:
         """
-        Back-project each detection into 3-D camera space.
+        Back-project each detection into 3-D space.
 
-        Samples the inner 50% of each bounding box and takes the median
-        depth (metres), then calls back_project() per detection centroid.
+        Pipeline per detection:
+          1. Sample inner-50% bbox region → median depth d (metres)
+          2. back_project(u, v, d, K) → (X,Y,Z) in camera frame
+          3. to_base_frame() → (X,Y,Z) in TidyBot base frame  [if in_base_frame]
 
         Parameters
         ----------
-        detections  : list[Detection]
-        depth_map   : H×W float32, metres (from latest_depth())
-        intrinsics  : CameraIntrinsics — needs .fx .fy .cx .cy
+        detections     : list[Detection]
+        depth_map      : H×W float32 metres (from latest_depth())
+        intrinsics     : CameraIntrinsics — needs .fx .fy .cx .cy
+        in_base_frame  : if True (default), transform output to robot base frame
 
         Returns
         -------
-        List of (X, Y, Z) in metres, one per detection (None if no valid depth).
+        List of (X, Y, Z) in metres, one per detection.
+        Camera frame if in_base_frame=False, base frame otherwise.
+        Returns None for any detection with no valid depth pixels.
         """
         results = []
         for det in detections:
@@ -182,10 +217,14 @@ class Localiser:
             if valid.size == 0:
                 results.append(None)
                 continue
-            d    = float(np.median(valid))
-            u, v = det.centroid_uv
-            X, Y, Z = self.back_project(u, v, d, intrinsics)
-            results.append((round(X, 2), round(Y, 2), round(Z, 2)))
+            d       = float(np.median(valid))
+            u, v    = det.centroid_uv
+            xyz_cam = self.back_project(u, v, d, intrinsics)
+            if in_base_frame:
+                xyz = self.to_base_frame(xyz_cam)
+            else:
+                xyz = xyz_cam
+            results.append(tuple(round(c, 3) for c in xyz))
         return results
 
     # ── drawing ───────────────────────────────────────────────────────────────
