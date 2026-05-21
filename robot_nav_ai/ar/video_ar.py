@@ -166,6 +166,8 @@ def main() -> None:
                         help="Path to room video (e.g. video/room_video.mp4)")
     parser.add_argument("--no-slam", action="store_true",
                         help="Disable visual SLAM (faster startup)")
+    parser.add_argument("--no-detect", action="store_true",
+                        help="Disable object detection")
     args = parser.parse_args()
 
     video_path = Path(args.video) if Path(args.video).is_absolute() \
@@ -174,6 +176,7 @@ def main() -> None:
     from ar.ar_renderer       import ARConfig, ARRenderer, CameraIntrinsics
     from ar.command_interface import CommandInterface, RobotController, Cmd
     from ar.slam              import VisualSLAM, SLAMConfig
+    from ar.object_detector   import ObjectDetector
 
     # ── open video ────────────────────────────────────────────────────────────
     player = VideoPlayer(str(video_path))
@@ -212,6 +215,15 @@ def main() -> None:
         slam = None
         print("[video_ar] SLAM disabled.")
 
+    # ── object detector ───────────────────────────────────────────────────────
+    use_detect = not args.no_detect
+    if use_detect:
+        detector = ObjectDetector(conf_thresh=0.30, every_n=3)
+        detector.start()
+        print("[video_ar] Object detector enabled (YOLOv8n).")
+    else:
+        detector = None
+
     # ── command interface ─────────────────────────────────────────────────────
     quit_event   = threading.Event()
     _cur_speed   = [0.0]   # shared mutable for SLAM worker
@@ -242,9 +254,11 @@ def main() -> None:
             if frame is None:
                 break
 
-            # Feed frame to SLAM
+            # Feed frame to SLAM and detector (non-blocking)
             if use_slam:
                 slam_worker.update(frame, _cur_speed[0])
+            if use_detect and detector is not None:
+                detector.update(frame)
 
             # Render TidyBot sprite at fixed screen position (lock prevents
             # physics thread corrupting MjData mid-render)
@@ -255,6 +269,10 @@ def main() -> None:
             renderer._blit(out, rgb, mask,
                            u - rgb.shape[1] // 2,
                            v - rgb.shape[0])
+
+            # Draw detection boxes (before minimap so minimap sits on top)
+            if use_detect and detector is not None:
+                out = detector.draw(out)
 
             # SLAM minimap overlay
             if use_slam and slam is not None:
@@ -287,6 +305,8 @@ def main() -> None:
     finally:
         if use_slam:
             slam_worker.stop()
+        if use_detect and detector is not None:
+            detector.stop()
         renderer.close()
         player.release()
         cv2.destroyAllWindows()
