@@ -42,7 +42,7 @@ class CameraIntrinsics:
 
 @dataclass
 class ARConfig:
-    xml_path:      Path             = ROOT / "robot" / "robot.xml"
+    xml_path:      Path             = ROOT / "robot" / "tidybot" / "ar_scene.xml"
     render_width:  int              = 640
     render_height: int              = 480
     intrinsics:    CameraIntrinsics = field(default_factory=CameraIntrinsics)
@@ -53,19 +53,19 @@ class ARConfig:
         default_factory=lambda: np.array([0.0, 1.6, 1.8])
     )
 
-    # Virtual camera for robot sprite (MuJoCo world: Z-up, so z=0.35 = robot centre)
+    # Virtual camera for TidyBot sprite (Z-up; robot centre ≈ z=0.55)
     sprite_lookat:    np.ndarray = field(
-        default_factory=lambda: np.array([0.1, 0.0, 0.35])
+        default_factory=lambda: np.array([0.0, 0.0, 0.55])
     )
-    sprite_distance:  float = 3.0
-    sprite_azimuth:   float = -45.0
-    sprite_elevation: float = -25.0
+    sprite_distance:  float = 2.8
+    sprite_azimuth:   float = -30.0
+    sprite_elevation: float = -18.0
 
     # Rendering
-    robot_height_m:   float = 1.2    # controls apparent pixel size in frame
+    robot_height_m:   float = 1.3    # TidyBot with retracted arm
     shadow_opacity:   float = 0.50
     robot_opacity:    float = 0.92   # blend factor for robot pixels
-    keyframe:         str   = "home"
+    keyframe:         str   = "retract"
     depth_far_thresh: float = 60.0   # depth (MuJoCo units) above = background
 
 
@@ -110,9 +110,10 @@ class ARRenderer:
         self._sprite_cam.azimuth    = cfg.sprite_azimuth
         self._sprite_cam.elevation  = cfg.sprite_elevation
 
-        # Hide ground plane in renders
+        # Hide ground plane, floor geom, and static scene elements
         self._opt = mujoco.MjvOption()
-        self._opt.flags[mujoco.mjtVisFlag.mjVIS_STATIC] = False
+        self._opt.flags[mujoco.mjtVisFlag.mjVIS_STATIC]    = False
+        self._opt.flags[mujoco.mjtVisFlag.mjVIS_CONSTRAINT] = False
 
         # Cache the sprite (re-rendered on pose change)
         self._sprite_rgb:  Optional[np.ndarray] = None
@@ -350,7 +351,7 @@ class ARRenderer:
 
         bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
         # Boost brightness to match indoor webcam exposure
-        bgr = cv2.convertScaleAbs(bgr, alpha=2.2, beta=50)
+        bgr = cv2.convertScaleAbs(bgr, alpha=1.6, beta=20)
         self._sprite_rgb  = bgr
         self._sprite_mask = mask
         self._sprite_dirty = False

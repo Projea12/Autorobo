@@ -16,6 +16,10 @@ Commands control how the robot moves through the room:
     home          → reset arm + pause
     quit / q      → exit
 
+SLAM runs in a background thread, building a sparse 3D map from the video
+and tracking where in the room the robot is. A minimap overlay shows the
+robot's trajectory.
+
 Usage:
     python ar/video_ar.py --video video/room_video.mp4
 """
@@ -41,8 +45,8 @@ sys.path.insert(0, str(ROOT))
 PLAYBACK = {
     "FORWARD"      : 2.0,
     "BACKWARD"     : -2.0,
-    "TURN_LEFT"    : 0.4,
-    "TURN_RIGHT"   : 0.4,
+    "TURN_LEFT"    : 0.5,
+    "TURN_RIGHT"   : 0.5,
     "STOP"         : 0.0,
     "ARM_UP"       : 0.0,
     "ARM_DOWN"     : 0.0,
@@ -68,7 +72,7 @@ class VideoPlayer:
             raise FileNotFoundError(f"Cannot open: {path}")
         self._total  = int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self._pos    = 0.0          # fractional frame position
-        self._speed  = 0.0          # frames to advance per tick (from command)
+        self._speed  = 0.0          # frames to advance per tick
         self._lock   = threading.Lock()
         self.width   = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.height  = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -88,6 +92,11 @@ class VideoPlayer:
         ok, frame = self._cap.read()
         return frame if ok else None
 
+    @property
+    def frame_index(self) -> int:
+        with self._lock:
+            return int(self._pos)
+
     def release(self) -> None:
         self._cap.release()
 
@@ -96,24 +105,67 @@ class VideoPlayer:
 
 def robot_screen_pos(w: int, h: int):
     """
-    Robot is always at the bottom-centre of the frame — like a robot
-    whose onboard camera always shows it in the same spot.
+    Robot is always at the bottom-centre of the frame.
     Returns (u, v, sprite_height_px).
     """
     u  = w // 2
     v  = int(h * 0.88)       # 88% down = near floor
-    sh = int(h * 0.38)       # robot takes up ~38% of frame height
+    sh = int(h * 0.42)       # robot takes up ~42% of frame height
     return u, v, sh
+
+
+# ── SLAM worker ───────────────────────────────────────────────────────────────
+
+class SLAMWorker:
+    """
+    Runs VisualSLAM in a background thread on every new frame.
+    Only starts processing when the video is playing (speed != 0).
+    """
+
+    def __init__(self, slam) -> None:
+        self._slam   = slam
+        self._frame  = None
+        self._speed  = 0.0
+        self._lock   = threading.Lock()
+        self._stop   = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def update(self, frame: np.ndarray, speed: float) -> None:
+        with self._lock:
+            self._frame = frame
+            self._speed = speed
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            with self._lock:
+                frame = self._frame
+                speed = self._speed
+
+            if frame is None or speed == 0.0:
+                time.sleep(0.05)
+                continue
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            self._slam.process(gray)
+            time.sleep(0.033)   # ~30 fps SLAM cap
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Autorobo — robot navigates through room video"
+        description="Autorobo — TidyBot navigates through room video with SLAM"
     )
     parser.add_argument("--video", required=True,
                         help="Path to room video (e.g. video/room_video.mp4)")
+    parser.add_argument("--no-slam", action="store_true",
+                        help="Disable visual SLAM (faster startup)")
     args = parser.parse_args()
 
     video_path = Path(args.video) if Path(args.video).is_absolute() \
@@ -121,45 +173,66 @@ def main() -> None:
 
     from ar.ar_renderer       import ARConfig, ARRenderer, CameraIntrinsics
     from ar.command_interface import CommandInterface, RobotController, Cmd
+    from ar.slam              import VisualSLAM, SLAMConfig
 
     # ── open video ────────────────────────────────────────────────────────────
     player = VideoPlayer(str(video_path))
-    print(f"[video_ar] {video_path.name}  "
-          f"{player.width}×{player.height}  {player.fps:.1f}fps  "
-          f"{player.width/player.fps:.0f}s")
+    W, H   = player.width, player.height
+    print(f"[video_ar] {video_path.name}  {W}×{H}  {player.fps:.1f}fps  "
+          f"{player._total} frames")
 
-    # ── build renderer ────────────────────────────────────────────────────────
+    # ── build AR renderer (TidyBot) ───────────────────────────────────────────
     ar_cfg = ARConfig(
-        render_width  = player.width,
-        render_height = player.height,
+        render_width  = W,
+        render_height = H,
         intrinsics    = CameraIntrinsics(
-            fx = player.width  * 1.1,
-            fy = player.width  * 1.1,
-            cx = player.width  / 2.0,
-            cy = player.height / 2.0,
+            fx = W * 1.1,
+            fy = W * 1.1,
+            cx = W / 2.0,
+            cy = H / 2.0,
         ),
     )
     renderer   = ARRenderer(ar_cfg)
     controller = RobotController()
 
+    # ── SLAM ──────────────────────────────────────────────────────────────────
+    use_slam = not args.no_slam
+    if use_slam:
+        slam_cfg = SLAMConfig(
+            fx = ar_cfg.intrinsics.fx,
+            fy = ar_cfg.intrinsics.fy,
+            cx = ar_cfg.intrinsics.cx,
+            cy = ar_cfg.intrinsics.cy,
+        )
+        slam       = VisualSLAM(slam_cfg)
+        slam_worker = SLAMWorker(slam)
+        slam_worker.start()
+        print("[video_ar] Visual SLAM enabled.")
+    else:
+        slam = None
+        print("[video_ar] SLAM disabled.")
+
     # ── command interface ─────────────────────────────────────────────────────
-    quit_event = threading.Event()
+    quit_event   = threading.Event()
+    _cur_speed   = [0.0]   # shared mutable for SLAM worker
 
     def on_command(cmd: Cmd) -> None:
         controller.set_command(cmd)
         speed = PLAYBACK.get(cmd.name, 0.0)
         player.set_speed(speed)
-        print(f"[video_ar] {cmd.name}  →  "
-              f"{'playing forward' if speed > 0 else 'playing backward' if speed < 0 else 'paused'}")
+        _cur_speed[0] = speed
+        direction = ("playing forward" if speed > 0
+                     else "playing backward" if speed < 0 else "paused")
+        print(f"[video_ar] {cmd.name}  →  {direction}")
 
     cmd_iface = CommandInterface(on_command=on_command, on_quit=quit_event.set)
     renderer.start_physics(controller=controller)
     cmd_iface.start()
 
-    # ── fixed robot position for this video ──────────────────────────────────
-    u, v, sprite_h = robot_screen_pos(player.width, player.height)
+    # ── fixed robot position ──────────────────────────────────────────────────
+    u, v, sprite_h = robot_screen_pos(W, H)
 
-    print("\n[video_ar] Ready.  Type a command to move the robot.\n")
+    print("\n[video_ar] Ready.  TidyBot loaded.\n")
     print("           forward / back / left / right / stop")
     print("           arm up / arm down / open / close / wave / home / quit\n")
 
@@ -169,22 +242,37 @@ def main() -> None:
             if frame is None:
                 break
 
-            # Render robot sprite at fixed screen position
-            rgb, mask = renderer._get_sprite(sprite_h)
+            # Feed frame to SLAM
+            if use_slam:
+                slam_worker.update(frame, _cur_speed[0])
+
+            # Render TidyBot sprite at fixed screen position (lock prevents
+            # physics thread corrupting MjData mid-render)
+            with renderer._physics_lock:
+                rgb, mask = renderer._get_sprite(sprite_h)
             out = frame.copy()
             renderer._draw_shadow(out, u, v, rgb.shape[1])
             renderer._blit(out, rgb, mask,
                            u - rgb.shape[1] // 2,
                            v - rgb.shape[0])
 
+            # SLAM minimap overlay
+            if use_slam and slam is not None:
+                slam.draw_minimap(out)
+
             # Status overlay
             cmd_name = controller.current().name
-            label    = f"{cmd_name}  |  {video_path.name}  |  Q=quit"
-            cv2.putText(out, label, (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+            if use_slam and slam is not None:
+                rx, rz = slam.position_xz
+                status = f"{cmd_name}  |  pos ({rx:.1f},{rz:.1f})m  |  Q=quit"
+            else:
+                status = f"{cmd_name}  |  {video_path.name}  |  Q=quit"
+
+            cv2.putText(out, status, (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                         (255, 255, 255), 2, cv2.LINE_AA)
-            cv2.putText(out, label, (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+            cv2.putText(out, status, (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                         (0, 0, 0), 1, cv2.LINE_AA)
 
             # Scale up for display
@@ -192,11 +280,13 @@ def main() -> None:
             dw      = int(out.shape[1] * dh / out.shape[0])
             display = cv2.resize(out, (dw, dh))
 
-            cv2.imshow("Autorobo — Room Navigation (Q to quit)", display)
+            cv2.imshow("Autorobo — TidyBot Navigation (Q to quit)", display)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
     finally:
+        if use_slam:
+            slam_worker.stop()
         renderer.close()
         player.release()
         cv2.destroyAllWindows()

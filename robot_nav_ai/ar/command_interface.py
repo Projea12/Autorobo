@@ -77,36 +77,56 @@ def parse(text: str) -> Optional[Cmd]:
 
 @dataclass
 class CtrlConfig:
-    wheel_speed:   float = 3.0    # rad/s — differential-drive velocity
-    turn_speed:    float = 2.5    # rad/s — pivot turn velocity
-    arm_home:      list  = None   # joint1..6 home positions (radians)
-    arm_ready:     list  = None   # joint1..6 ready positions
-    gripper_open:  float = 0.04   # metres
-    gripper_close: float = 0.0    # metres
+    move_speed:    float = 0.05    # metres per physics step (base x/y position)
+    turn_speed:    float = 0.03    # radians per physics step (base yaw)
+
+    # TidyBot home arm positions (ctrl[3..9] = joint_1..7)
+    arm_home:  list = None
+    arm_ready: list = None   # raised / ready pose
+
 
     def __post_init__(self):
+        # From TidyBot "home" keyframe
         if self.arm_home is None:
-            self.arm_home  = [0.0, -1.5708, 0.0, 0.0, 0.0, 0.0]
+            self.arm_home  = [0.0, 0.26179939, 3.14159265, -2.26892803,
+                              0.0, 0.95993109, 1.57079633]
+        # Raised: lift joint_2 up, extend slightly
         if self.arm_ready is None:
-            self.arm_ready = [0.0, -0.7854, 1.0472, 0.0, 0.0, 0.0]
+            self.arm_ready = [0.0, -0.34906585, 3.14159265, -2.54818071,
+                              0.0, -0.87266463, 1.57079633]
 
 
 class RobotController:
     """
-    Translates Cmd values into MuJoCo ctrl signals.
+    Translates Cmd values into TidyBot MuJoCo ctrl signals.
 
-    ctrl layout (9 values):
-        [0] drive_left   — velocity (rad/s)
-        [1] drive_right  — velocity (rad/s)
-        [2-7] arm_j1..6 — position (rad)
-        [8]  gripper     — position (m)
+    TidyBot ctrl layout (11 values):
+        [0]  joint_x    — base x position (m)
+        [1]  joint_y    — base y position (m)
+        [2]  joint_th   — base yaw (rad)
+        [3]  joint_1    — Kinova arm joint 1 (rad)
+        [4]  joint_2    — Kinova arm joint 2 (rad)
+        [5]  joint_3    — Kinova arm joint 3 (rad)
+        [6]  joint_4    — Kinova arm joint 4 (rad)
+        [7]  joint_5    — Kinova arm joint 5 (rad)
+        [8]  joint_6    — Kinova arm joint 6 (rad)
+        [9]  joint_7    — Kinova arm joint 7 (rad)
+        [10] fingers    — gripper (0=open, 255=closed)
     """
 
     def __init__(self, cfg: CtrlConfig = CtrlConfig()) -> None:
-        self.cfg      = cfg
-        self._cmd     = Cmd.STOP
-        self._lock    = threading.Lock()
-        self._t_wave  = 0.0     # wave animation timer
+        self.cfg     = cfg
+        self._cmd    = Cmd.STOP
+        self._lock   = threading.Lock()
+        self._t_wave = 0.0
+
+        # Accumulated base pose (position-controlled base)
+        self._base_x  = 0.0
+        self._base_y  = 0.0
+        self._base_th = 0.0
+
+        # Last arm positions — held between arm commands so arm never collapses
+        self._arm_pos = list(cfg.arm_home)
 
     def set_command(self, cmd: Cmd) -> None:
         with self._lock:
@@ -124,45 +144,52 @@ class RobotController:
 
         cfg = self.cfg
 
-        # ── wheel control ──────────────────────────────────────────────────
+        # ── base motion (position accumulation) ───────────────────────────
         if cmd == Cmd.FORWARD:
-            ctrl[0] =  cfg.wheel_speed
-            ctrl[1] =  cfg.wheel_speed
+            self._base_x += cfg.move_speed * np.sin(self._base_th)
+            self._base_y += cfg.move_speed * np.cos(self._base_th)
         elif cmd == Cmd.BACKWARD:
-            ctrl[0] = -cfg.wheel_speed
-            ctrl[1] = -cfg.wheel_speed
+            self._base_x -= cfg.move_speed * np.sin(self._base_th)
+            self._base_y -= cfg.move_speed * np.cos(self._base_th)
         elif cmd == Cmd.TURN_LEFT:
-            ctrl[0] = -cfg.turn_speed
-            ctrl[1] =  cfg.turn_speed
+            self._base_th -= cfg.turn_speed
         elif cmd == Cmd.TURN_RIGHT:
-            ctrl[0] =  cfg.turn_speed
-            ctrl[1] = -cfg.turn_speed
-        else:
-            ctrl[0] = 0.0
-            ctrl[1] = 0.0
+            self._base_th += cfg.turn_speed
+        elif cmd == Cmd.HOME:
+            self._base_x  = 0.0
+            self._base_y  = 0.0
+            self._base_th = 0.0
 
-        # ── arm control ────────────────────────────────────────────────────
-        if cmd == Cmd.HOME:
-            for i, v in enumerate(cfg.arm_home):
-                ctrl[2 + i] = v
+        ctrl[0] = self._base_x
+        ctrl[1] = self._base_y
+        ctrl[2] = self._base_th
+
+        # ── arm control — always write arm positions so joints never collapse ──
+        if cmd in (Cmd.HOME, Cmd.ARM_DOWN):
+            self._arm_pos = list(cfg.arm_home)
         elif cmd == Cmd.ARM_UP:
-            for i, v in enumerate(cfg.arm_ready):
-                ctrl[2 + i] = v
-        elif cmd == Cmd.ARM_DOWN:
-            for i, v in enumerate(cfg.arm_home):
-                ctrl[2 + i] = v
+            self._arm_pos = list(cfg.arm_ready)
         elif cmd == Cmd.WAVE:
-            self._t_wave += 0.002   # step with physics dt
-            ctrl[2] = 0.0
-            ctrl[3] = -0.8 + 0.4 * np.sin(self._t_wave * 3.0)
-            ctrl[4] =  1.0
-            ctrl[5] =  0.5 * np.sin(self._t_wave * 6.0)
+            self._t_wave += 0.002
+            self._arm_pos = [
+                0.0,
+                0.26179939 + 0.5 * np.sin(self._t_wave * 3.0),
+                3.14159265,
+                -2.26892803 + 0.4 * np.sin(self._t_wave * 2.0),
+                0.0,
+                0.95993109,
+                1.57079633,
+            ]
+
+        # Always write stored arm position — holds pose between commands
+        for i, v in enumerate(self._arm_pos):
+            ctrl[3 + i] = v
 
         # ── gripper control ────────────────────────────────────────────────
         if cmd == Cmd.GRIPPER_OPEN:
-            ctrl[8] = cfg.gripper_open
+            ctrl[10] = 0.0
         elif cmd in (Cmd.GRIPPER_CLOSE, Cmd.HOME):
-            ctrl[8] = cfg.gripper_close
+            ctrl[10] = 200.0
 
 
 # ── input thread ──────────────────────────────────────────────────────────────
