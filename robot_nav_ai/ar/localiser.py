@@ -86,8 +86,13 @@ class Localiser:
     every_n     : run depth inference on every Nth frame (default 5)
     """
 
-    def __init__(self, every_n: int = 5) -> None:
+    def __init__(self, every_n: int = 5, smooth_alpha: float = 0.35) -> None:
         self._every_n    = every_n
+        # Exponential moving average per track_id → smooth coordinate updates.
+        # alpha=0.35: new reading contributes 35%, history 65% — glides smoothly.
+        self._smooth_alpha = smooth_alpha
+        self._smooth: dict[int, Tuple[float, float, float]] = {}
+
         self._frame_in: Optional[np.ndarray] = None
         self._depth_out: Optional[np.ndarray] = None
         self._frame_count = 0
@@ -210,6 +215,7 @@ class Localiser:
         Camera frame if in_base_frame=False, base frame otherwise.
         Returns None for any detection with no valid depth pixels.
         """
+        a = self._smooth_alpha
         results = []
         for det in detections:
             patch = _inner_region(det.bbox_xyxy, depth_map)
@@ -220,10 +226,20 @@ class Localiser:
             d       = float(np.median(valid))
             u, v    = det.centroid_uv
             xyz_cam = self.back_project(u, v, d, intrinsics)
-            if in_base_frame:
-                xyz = self.to_base_frame(xyz_cam)
-            else:
-                xyz = xyz_cam
+            xyz     = self.to_base_frame(xyz_cam) if in_base_frame else xyz_cam
+
+            # Exponential moving average keyed by track_id — smooths jitter
+            tid = det.track_id
+            if tid >= 0 and tid in self._smooth:
+                prev = self._smooth[tid]
+                xyz  = (
+                    a * xyz[0] + (1 - a) * prev[0],
+                    a * xyz[1] + (1 - a) * prev[1],
+                    a * xyz[2] + (1 - a) * prev[2],
+                )
+            if tid >= 0:
+                self._smooth[tid] = xyz
+
             results.append(tuple(round(c, 3) for c in xyz))
         return results
 
@@ -236,21 +252,23 @@ class Localiser:
         xyz_list: List[Optional[Tuple[float, float, float]]],
     ) -> np.ndarray:
         """
-        Overlay (X, Y, Z) labels just above each detection bounding box.
-        Format: `+0.3,−0.1, 1.4m`
+        Overlay 3D position labels on each detection bounding box.
+        Format: `mug @ (+0.12, +0.05, 0.83)m`
+        Drawn just above the existing YOLO label line.
         """
         for det, xyz in zip(detections, xyz_list):
             if xyz is None:
                 continue
             x1, y1, _, _ = det.bbox_xyxy
-            label = f"{xyz[0]:+.1f},{xyz[1]:+.1f},{xyz[2]:.2f}m"
-            ty    = max(y1 - 4, 14)
+            label = f"{det.label} @ ({xyz[0]:+.2f}, {xyz[1]:+.2f}, {xyz[2]:.2f})m"
+            ty    = max(y1 - 20, 14)
+            # Outline then fill for readability over any background
             cv2.putText(frame, label, (x1, ty),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.42,
-                        (255, 255, 0), 2, cv2.LINE_AA)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.44,
+                        (0, 0, 0), 3, cv2.LINE_AA)
             cv2.putText(frame, label, (x1, ty),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.42,
-                        (0, 0, 0), 1, cv2.LINE_AA)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.44,
+                        (255, 255, 0), 1, cv2.LINE_AA)
         return frame
 
     # ── background inference loop ─────────────────────────────────────────────
