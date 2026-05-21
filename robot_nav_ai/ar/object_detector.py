@@ -29,6 +29,30 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parent.parent
 
+# ── Home robot vocabulary ─────────────────────────────────────────────────────
+# Used when running YOLO-World (open vocabulary).
+# Add anything you want the robot to be able to see and pick up.
+HOME_CLASSES = [
+    # Furniture
+    "chair", "couch", "sofa", "bed", "table", "desk", "shelf", "wardrobe",
+    "cabinet", "drawer", "door", "window", "mirror", "curtain", "pillow",
+    # Containers / storage
+    "box", "basket", "bag", "backpack", "suitcase", "bin", "bucket",
+    # Kitchen
+    "cup", "mug", "bottle", "bowl", "plate", "glass", "fork", "knife",
+    "spoon", "kettle", "thermos", "can",
+    # Electronics
+    "phone", "laptop", "remote", "keyboard", "mouse", "charger", "cable",
+    "tv", "speaker", "headphones", "tablet", "camera",
+    # Everyday objects
+    "book", "pen", "pencil", "scissors", "tape", "keys", "wallet",
+    "glasses", "watch", "shoe", "clothing", "towel", "umbrella",
+    # Food / plants
+    "apple", "banana", "orange", "bottle", "potted plant",
+    # Cleaning
+    "broom", "mop", "dustpan", "spray bottle",
+]
+
 
 # ── Detection result ──────────────────────────────────────────────────────────
 
@@ -60,17 +84,33 @@ class ObjectDetector:
 
     def __init__(
         self,
-        weights:     str   = "yolov8n.pt",
-        every_n:     int   = 3,
-        conf_thresh: float = 0.30,
-        device:      str   = "mps",
+        weights:     str        = "yolov8s-world.pt",
+        every_n:     int        = 3,
+        conf_thresh: float      = 0.20,
+        device:      str        = "mps",
+        classes:     list       = None,
     ) -> None:
         from ultralytics import YOLO
-        print(f"[detector] Loading {weights} on {device} ...")
-        self._model      = YOLO(weights)
-        self._device     = device
-        self._conf       = conf_thresh
-        self._every_n    = every_n
+
+        self._is_world = "world" in weights.lower()
+        if self._is_world and self._clip_ready():
+            print(f"[detector] Loading {weights} (open-vocabulary) on {device} ...")
+            self._model = YOLO(weights)
+            vocab = classes if classes is not None else HOME_CLASSES
+            self._model.set_classes(vocab)
+            print(f"[detector] YOLO-World ready — {len(vocab)} home classes.")
+        else:
+            if self._is_world:
+                print("[detector] YOLO-World CLIP encoder not ready.")
+                print("[detector] Falling back to yolov8n.pt — run once to download CLIP (~338MB).")
+            else:
+                print(f"[detector] Loading {weights} on {device} ...")
+            self._model    = YOLO("yolov8n.pt")
+            self._is_world = False
+
+        self._device  = device
+        self._conf    = conf_thresh
+        self._every_n = every_n
 
         self._lock        = threading.Lock()
         self._frame_in    = None          # latest frame from main thread
@@ -82,6 +122,7 @@ class ObjectDetector:
 
         # Colours per class (consistent across frames)
         self._colours: dict[str, Tuple[int,int,int]] = {}
+        self._target_label: Optional[str] = None
         print("[detector] Ready.")
 
     # ── public API ────────────────────────────────────────────────────────────
@@ -111,49 +152,104 @@ class ObjectDetector:
 
     def query(self, label: str) -> Optional[Detection]:
         """
-        Return the highest-confidence detection matching label,
-        or None if not currently visible.
-        e.g. detector.query('bottle')
+        Return the best detection matching a natural-language label.
+        Tries exact match first, then partial/synonym match.
+        e.g. query('bottle'), query('mug'), query('pick up the cup')
         """
-        matches = [d for d in self.latest if d.label == label]
+        label = _extract_object_label(label)
+        dets  = self.latest
+
+        # 1 — exact class name match
+        matches = [d for d in dets if d.label == label]
+
+        # 2 — partial match (e.g. 'cell phone' contains 'phone')
+        if not matches:
+            matches = [d for d in dets if label in d.label or d.label in label]
+
+        # 3 — synonym match
+        if not matches:
+            syns = _SYNONYMS.get(label, [])
+            matches = [d for d in dets if d.label in syns]
+
         if not matches:
             return None
-        return max(matches, key=lambda d: d.confidence)
+
+        # When multiple instances, pick the one closest to frame centre
+        if len(matches) == 1:
+            return matches[0]
+        return min(matches, key=lambda d: _dist_to_centre(d, self._frame_in))
+
+    def set_target(self, label: str) -> bool:
+        """
+        Lock onto an object by label. Returns True if found.
+        The locked target is highlighted differently in draw().
+        """
+        with self._lock:
+            self._target_label = _extract_object_label(label)
+        found = self.query(label) is not None
+        if found:
+            print(f"[detector] Target locked: '{self._target_label}'")
+        else:
+            print(f"[detector] '{self._target_label}' not visible yet — will highlight when found")
+        return found
+
+    def clear_target(self) -> None:
+        with self._lock:
+            self._target_label = None
 
     def draw(self, frame: np.ndarray) -> np.ndarray:
-        """Draw bounding boxes and labels onto a copy of frame."""
-        out  = frame.copy()
-        dets = self.latest
+        """Draw bounding boxes and labels. Target object is highlighted green."""
+        out    = frame.copy()
+        dets   = self.latest
+        target = self._target_label
+
         for det in dets:
+            is_target = (target is not None and
+                         (det.label == target or target in det.label
+                          or det.label in _SYNONYMS.get(target, [])))
+
+            colour    = (0, 255, 80) if is_target else self._class_colour(det.label)
+            thickness = 3            if is_target else 2
             x1, y1, x2, y2 = det.bbox_xyxy
-            colour = self._class_colour(det.label)
 
-            # Box
-            cv2.rectangle(out, (x1, y1), (x2, y2), colour, 2)
+            # Pulsing highlight for target
+            if is_target:
+                cv2.rectangle(out, (x1-3, y1-3), (x2+3, y2+3), (0,255,80), 1)
 
-            # Label background
-            label_txt = f"{det.label} {det.confidence:.0%}"
-            (tw, th), _ = cv2.getTextSize(
-                label_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
-            )
-            cv2.rectangle(out,
-                          (x1, y1 - th - 6), (x1 + tw + 4, y1),
-                          colour, -1)
-            cv2.putText(out, label_txt,
-                        (x1 + 2, y1 - 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                        (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.rectangle(out, (x1, y1), (x2, y2), colour, thickness)
 
-            # Centroid dot
+            label_txt = f"{'► ' if is_target else ''}{det.label} {det.confidence:.0%}"
+            (tw, th), _ = cv2.getTextSize(label_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            cv2.rectangle(out, (x1, y1-th-6), (x1+tw+4, y1), colour, -1)
+            cv2.putText(out, label_txt, (x1+2, y1-4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0) if is_target else (255,255,255),
+                        1, cv2.LINE_AA)
+
             u, v = det.centroid_uv
-            cv2.circle(out, (u, v), 4, colour, -1)
+            cv2.circle(out, (u, v), 5 if is_target else 3, colour, -1)
 
-        # FPS counter
-        cv2.putText(out, f"det {self._fps:.1f}fps",
-                    (10, frame.shape[0] - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4,
-                    (200, 200, 200), 1, cv2.LINE_AA)
+        # FPS + target status
+        status = f"det {self._fps:.1f}fps"
+        if target:
+            found  = any(d.label == target or target in d.label for d in dets)
+            status += f"  |  target: {target} {'✓' if found else '(searching...)'}"
+        cv2.putText(out, status, (10, frame.shape[0]-10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200,200,200), 1, cv2.LINE_AA)
         return out
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _clip_ready() -> bool:
+        """Return True only if the CLIP ViT-B-32 encoder is fully downloaded."""
+        import hashlib
+        clip_path = Path.home() / ".cache" / "clip" / "ViT-B-32.pt"
+        expected_size = 354_226_516   # 338 MB
+        if not clip_path.exists():
+            return False
+        if clip_path.stat().st_size < expected_size * 0.99:
+            return False
+        return True
 
     # ── background loop ───────────────────────────────────────────────────────
 
@@ -222,6 +318,48 @@ class ObjectDetector:
         return self._colours[label]
 
 
+# ── label helpers ────────────────────────────────────────────────────────────
+
+# Common synonyms → COCO class names
+_SYNONYMS: dict[str, list] = {
+    "mug":        ["cup"],
+    "glass":      ["wine glass", "cup"],
+    "phone":      ["cell phone"],
+    "mobile":     ["cell phone"],
+    "couch":      ["couch", "sofa"],
+    "sofa":       ["couch"],
+    "fridge":     ["refrigerator"],
+    "tv":         ["tv", "monitor"],
+    "laptop":     ["laptop"],
+    "bag":        ["handbag", "backpack", "suitcase"],
+    "luggage":    ["suitcase"],
+    "plant":      ["potted plant"],
+    "remote":     ["remote"],
+    "controller": ["remote"],
+    "toothbrush": ["toothbrush"],
+}
+
+# Words to strip from natural language commands
+_STRIP = {"pick", "up", "grab", "get", "fetch", "bring", "take",
+          "the", "a", "an", "that", "this", "please", "me", "for", "i"}
+
+
+def _extract_object_label(text: str) -> str:
+    """'pick up the bottle' → 'bottle'  (word-level strip, not substring)"""
+    words = text.strip().lower().split()
+    kept  = [w for w in words if w not in _STRIP]
+    return " ".join(kept) if kept else text.strip().lower()
+
+
+def _dist_to_centre(det: "Detection", frame) -> float:
+    """Distance from detection centroid to frame centre."""
+    if frame is None:
+        return 0.0
+    h, w = frame.shape[:2]
+    u, v = det.centroid_uv
+    return ((u - w/2)**2 + (v - h/2)**2) ** 0.5
+
+
 # ── standalone test ───────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -230,8 +368,10 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="Object detector test")
     parser.add_argument("--video", required=True)
-    parser.add_argument("--conf", type=float, default=0.30)
-    parser.add_argument("--every-n", type=int, default=3)
+    parser.add_argument("--conf",    type=float, default=0.20)
+    parser.add_argument("--every-n", type=int,   default=3)
+    parser.add_argument("--weights",  type=str,  default="yolov8s-world.pt",
+                        help="Model weights: yolov8n.pt (fast) or yolov8s-world.pt (anything)")
     args = parser.parse_args()
 
     video_path = ROOT / args.video if not Path(args.video).is_absolute() \
@@ -241,7 +381,11 @@ def main() -> None:
     if not cap.isOpened():
         print(f"Cannot open {video_path}"); return
 
-    detector = ObjectDetector(conf_thresh=args.conf, every_n=args.every_n)
+    detector = ObjectDetector(
+        weights     = args.weights,
+        conf_thresh = args.conf,
+        every_n     = args.every_n,
+    )
     detector.start()
 
     fps_times = []

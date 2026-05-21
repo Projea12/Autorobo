@@ -237,6 +237,17 @@ def main() -> None:
                      else "playing backward" if speed < 0 else "paused")
         print(f"[video_ar] {cmd.name}  →  {direction}")
 
+    def on_pick_command(text: str) -> bool:
+        """Handle 'pick up X' — lock detector onto target object."""
+        t = text.strip().lower()
+        pick_words = ["pick", "grab", "get", "fetch", "bring"]
+        if not any(w in t for w in pick_words):
+            return False
+        if use_detect and detector is not None:
+            detector.set_target(t)
+            print(f"[video_ar] Searching for target: '{t}'")
+        return True
+
     cmd_iface = CommandInterface(on_command=on_command, on_quit=quit_event.set)
     renderer.start_physics(controller=controller)
     cmd_iface.start()
