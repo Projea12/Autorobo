@@ -34,6 +34,11 @@
   <!-- ── compiler ───────────────────────────────────────────────────────── -->
   <compiler angle="radian" autolimits="true"/>
 
+  <!-- ── offscreen framebuffer — must be >= any Renderer height used ───── -->
+  <visual>
+    <global offwidth="1280" offheight="1280"/>
+  </visual>
+
   <!-- ── physics options ───────────────────────────────────────────────── -->
   <option timestep="0.002" gravity="0 0 -9.81" integrator="RK4"/>
 

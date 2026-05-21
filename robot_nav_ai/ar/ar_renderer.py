@@ -50,7 +50,7 @@ class ARConfig:
     # Where the robot stands in the AR world (OpenCV world frame, metres)
     # x=0 centre, y=1.6 below camera (floor level), z=2.5 in front
     robot_world_pos: np.ndarray = field(
-        default_factory=lambda: np.array([0.0, 1.6, 2.5])
+        default_factory=lambda: np.array([0.0, 1.6, 1.8])
     )
 
     # Virtual camera for robot sprite (MuJoCo world: Z-up, so z=0.35 = robot centre)
@@ -62,7 +62,7 @@ class ARConfig:
     sprite_elevation: float = -25.0
 
     # Rendering
-    robot_height_m:   float = 0.55   # controls apparent pixel size in frame
+    robot_height_m:   float = 1.2    # controls apparent pixel size in frame
     shadow_opacity:   float = 0.50
     robot_opacity:    float = 0.92   # blend factor for robot pixels
     keyframe:         str   = "home"
@@ -131,14 +131,15 @@ class ARRenderer:
 
         print("[ARRenderer] Ready.")
 
-    def start_physics(self, fps: float = 30.0) -> None:
-        """
-        Start MuJoCo physics in a background thread.
-        Wheels spin idle; arm oscillates gently to show live simulation.
-        """
+    def start_physics(
+        self,
+        fps: float = 30.0,
+        controller=None,
+    ) -> None:
+        """Start MuJoCo physics in a background thread."""
         if self._physics_thread and self._physics_thread.is_alive():
             return
-
+        self._controller = controller
         self._physics_stop.clear()
         self._physics_thread = threading.Thread(
             target=self._physics_loop, args=(fps,), daemon=True
@@ -150,34 +151,24 @@ class ARRenderer:
         self._physics_stop.set()
 
     def _physics_loop(self, fps: float) -> None:
-        mj      = self._mj
-        model   = self._model
-        dt      = 1.0 / fps
-        t_sim   = 0.0
-
-        # ctrl indices: [wheel_left, wheel_right, joint1..6, finger_left, finger_right]
-        # Slow idle wheel spin
-        wheel_speed = 0.4   # rad/s
+        mj    = self._mj
+        model = self._model
+        dt    = 1.0 / fps
 
         while not self._physics_stop.is_set():
             t0 = time.perf_counter()
 
             with self._physics_lock:
-                # Wheel spin
-                self._data.ctrl[0] =  wheel_speed
-                self._data.ctrl[1] = -wheel_speed
-
-                # Gentle arm oscillation on joint4 (wrist)
-                self._data.ctrl[6] = 0.25 * np.sin(t_sim * 0.8)
-
+                if self._controller is not None:
+                    self._controller.apply(
+                        self._data.ctrl, float(self._data.time)
+                    )
                 mj.mj_step(model, self._data)
-                t_sim += model.opt.timestep
 
             self._sprite_dirty = True
 
             elapsed = time.perf_counter() - t0
-            sleep   = max(0.0, dt - elapsed)
-            time.sleep(sleep)
+            time.sleep(max(0.0, dt - elapsed))
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -411,35 +402,84 @@ def main() -> None:
     sys.path.insert(0, str(ROOT))
 
     parser = argparse.ArgumentParser(
-        description="Autorobo AR renderer — robot overlaid on webcam"
+        description="Autorobo AR renderer — robot overlaid on video or webcam"
     )
     parser.add_argument("--camera", type=int, default=0)
+    parser.add_argument("--video",  type=str, default=None,
+                        help="Path to video file (e.g. video/room_video.mp4)")
     parser.add_argument("--no-preview", action="store_true")
     args = parser.parse_args()
 
-    from ar.depth_estimator import DepthConfig, DepthEstimator
-    from ar.camera_tracker  import CameraTracker
+    from ar.depth_estimator    import DepthEstimator, DepthConfig
+    from ar.camera_tracker     import CameraTracker
+    from ar.command_interface  import CommandInterface, RobotController
 
-    depth_cfg = DepthConfig(camera_index=args.camera)
-    estimator = DepthEstimator(depth_cfg)
-    tracker   = CameraTracker()
-    renderer  = ARRenderer()
-    renderer.start_physics()
+    # ── open video or webcam ──────────────────────────────────────────────────
+    use_video = args.video is not None
+    if use_video:
+        video_path = Path(args.video) if Path(args.video).is_absolute() \
+                     else ROOT / args.video
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            print(f"Cannot open video: {video_path}")
+            return
+        vid_w  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        vid_h  = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        vid_fps = cap.get(cv2.CAP_PROP_FPS)
+        print(f"[AR] Video: {video_path.name}  {vid_w}×{vid_h}  {vid_fps:.1f}fps")
+
+        # Phone camera intrinsics for this resolution
+        ar_cfg = ARConfig(
+            render_width  = vid_w,
+            render_height = vid_h,
+            intrinsics    = CameraIntrinsics(
+                fx = vid_w * 1.1,   # phone camera ~70° horizontal FOV
+                fy = vid_w * 1.1,
+                cx = vid_w / 2.0,
+                cy = vid_h / 2.0,
+            ),
+        )
+
+        def read_frame():
+            ok, frame = cap.read()
+            if not ok:                   # video ended — loop back to start
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ok, frame = cap.read()
+            return frame if ok else None
+
+        def release(): cap.release()
+
+    else:
+        depth_cfg = DepthConfig(camera_index=args.camera)
+        _est = DepthEstimator(depth_cfg)
+        _est.open_camera()
+        ar_cfg = ARConfig()
+        vid_fps = 30.0
+
+        def read_frame(): return _est.read_frame()
+        def release():    _est.close_camera()
+
+    # ── build pipeline ────────────────────────────────────────────────────────
+    estimator  = DepthEstimator(DepthConfig())   # for depth inference only
+    renderer   = ARRenderer(ar_cfg)
+    controller = RobotController()
+
+    quit_event = threading.Event()
+    cmd_iface  = CommandInterface(
+        on_command = controller.set_command,
+        on_quit    = quit_event.set,
+    )
+    renderer.start_physics(controller=controller)
+    cmd_iface.start()
 
     if args.no_preview:
         print("ARRenderer ready.")
         renderer.close()
+        release()
         return
 
-    estimator.open_camera()
-
-    lock     = threading.Lock()
-    shared: dict = {
-        "frame": None,
-        "pose":  np.eye(4),
-        "fps":   0.0,
-        "feats": 0,
-    }
+    lock   = threading.Lock()
+    shared = {"frame": None, "pose": np.eye(4), "fps": 0.0}
 
     def inference_loop() -> None:
         while not stop_event.is_set():
@@ -448,52 +488,49 @@ def main() -> None:
             if frame is None:
                 time.sleep(0.01)
                 continue
-
             t0    = time.perf_counter()
             depth = estimator.estimate(frame)
-            result = tracker.update(frame, depth)
             elapsed = time.perf_counter() - t0
-
             with lock:
-                shared["pose"]  = result.pose.copy()
-                shared["fps"]   = 1.0 / elapsed if elapsed > 0 else 0.0
-                shared["feats"] = result.n_features
-
-            print(f"[ar] {result.status:<8}  feats={result.n_features:3d}  "
-                  f"{shared['fps']:.1f}fps")
+                shared["fps"] = 1.0 / elapsed if elapsed > 0 else 0.0
+            print(f"[ar] depth {elapsed*1000:.0f}ms  {shared['fps']:.1f}fps")
 
     stop_event = threading.Event()
     worker = threading.Thread(target=inference_loop, daemon=True)
     worker.start()
 
-    print("\n[ARRenderer] Robot overlaid on webcam.  Move camera slowly.  Q to quit.\n")
+    frame_delay = max(1, int(1000 / vid_fps))
+    source_label = Path(args.video).name if use_video else "webcam"
+    print(f"\n[AR] Running on {source_label}.  Type commands in terminal.  Q to quit.\n")
 
     try:
         while True:
-            frame = estimator.read_frame()
+            frame = read_frame()
             if frame is None:
                 break
 
             with lock:
                 shared["frame"] = frame.copy()
-                pose  = shared["pose"].copy()
-                fps   = shared["fps"]
-                feats = shared["feats"]
+                fps = shared["fps"]
 
-            # AR composite
-            out = renderer.composite(frame, pose)
+            out = renderer.composite(frame, shared["pose"])
 
-            label = f"AR  feats={feats}  {fps:.1f}fps  Q=quit"
+            label = f"AR  {source_label}  {fps:.1f}fps  Q=quit"
             cv2.putText(out, label, (10, 25),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
 
-            cv2.imshow("Autorobo — AR Preview (Q to quit)", out)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+            # Scale up for display so portrait video fills the screen nicely
+            dh = 720
+            dw = int(out.shape[1] * dh / out.shape[0])
+            display = cv2.resize(out, (dw, dh))
+
+            cv2.imshow("Autorobo — AR Preview (Q to quit)", display)
+            if cv2.waitKey(1) & 0xFF == ord("q") or quit_event.is_set():
                 break
 
     finally:
         stop_event.set()
-        estimator.close_camera()
+        release()
         renderer.close()
         cv2.destroyAllWindows()
         print("[ARRenderer] Stopped.")
