@@ -144,8 +144,9 @@ class IoUTracker:
                 continue
             tid = live_ids[j]
             detections[i].track_id = tid
-            self._tracks[tid]["bbox"] = det_boxes[i]
-            self._tracks[tid]["age"]  = 0
+            self._tracks[tid]["bbox"]     = det_boxes[i]
+            self._tracks[tid]["centroid"] = detections[i].centroid_uv
+            self._tracks[tid]["age"]      = 0
             matched_det.add(i)
             matched_trk.add(j)
 
@@ -154,9 +155,10 @@ class IoUTracker:
             if i not in matched_det:
                 det.track_id = self._next_id
                 self._tracks[self._next_id] = {
-                    "bbox":  det.bbox_xyxy,
-                    "label": det.label,
-                    "age":   0,
+                    "bbox":     det.bbox_xyxy,
+                    "centroid": det.centroid_uv,
+                    "label":    det.label,
+                    "age":      0,
                 }
                 self._next_id += 1
 
@@ -225,7 +227,7 @@ class ObjectDetector:
         # Colours per track ID (stable colour = stable ID)
         self._colours: dict[int, Tuple[int,int,int]] = {}
         self._target_label: Optional[str] = None
-        self._tracker = IoUTracker(iou_thresh=0.30, max_age=8)
+        self._tracker = IoUTracker(iou_thresh=0.15, dist_thresh=80.0, max_age=12)
         print("[detector] Ready.")
 
     # ── public API ────────────────────────────────────────────────────────────
