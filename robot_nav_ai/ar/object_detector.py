@@ -319,7 +319,7 @@ class ObjectDetector:
         # Colours per track ID (stable colour = stable ID)
         self._colours: dict[int, Tuple[int,int,int]] = {}
         self._target_label: Optional[str] = None
-        self._tracker = IoUTracker(iou_hi=0.20, dist_thresh=120.0, max_age=15, min_hits=2)
+        self._tracker = IoUTracker(iou_hi=0.20, dist_thresh=120.0, max_age=20, min_hits=1)
         print("[detector] Ready.")
 
     # ── public API ────────────────────────────────────────────────────────────
@@ -504,8 +504,9 @@ class ObjectDetector:
                 centroid_uv = (cx, cy),
             ))
 
-        # Per-label NMS: suppress overlapping boxes of the same class
-        return _label_nms(raw, iou_thresh=0.40)
+        # Per-label NMS: suppress overlapping boxes of the same class.
+        # Low threshold (0.25) catches YOLO-World over-splitting large objects.
+        return _label_nms(raw, iou_thresh=0.25)
 
     def _track_colour(self, track_id: int) -> Tuple[int, int, int]:
         """Stable colour per track ID — same object always same colour."""
