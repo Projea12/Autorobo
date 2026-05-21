@@ -295,9 +295,15 @@ def main() -> None:
                            u - rgb.shape[1] // 2,
                            v - rgb.shape[0])
 
-            # Draw detection boxes (before minimap so minimap sits on top)
+            # Draw detection boxes + 3D positions (before minimap)
             if use_detect and detector is not None:
                 out = detector.draw(out)
+                if use_depth and localiser is not None:
+                    depth_map = localiser.latest_depth()
+                    if depth_map is not None:
+                        dets = detector.latest
+                        xyz_list = localiser.localise(dets, depth_map, ar_cfg.intrinsics)
+                        Localiser.draw_3d(out, dets, xyz_list)
 
             # SLAM minimap overlay
             if use_slam and slam is not None:
@@ -332,6 +338,8 @@ def main() -> None:
             slam_worker.stop()
         if use_detect and detector is not None:
             detector.stop()
+        if use_depth and localiser is not None:
+            localiser.stop()
         renderer.close()
         player.release()
         cv2.destroyAllWindows()

@@ -31,15 +31,19 @@ from transformers import pipeline
 
 # ── config ────────────────────────────────────────────────────────────────────
 
+METRIC_MODEL   = "depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf"
+RELATIVE_MODEL = "depth-anything/Depth-Anything-V2-Small-hf"
+
+
 @dataclass
 class DepthConfig:
     """Configuration for the depth estimator."""
-    model_name:   str   = "depth-anything/Depth-Anything-V2-Small-hf"
+    model_name:   str   = METRIC_MODEL
     camera_index: int   = 0          # 0 = built-in MacBook webcam
     frame_width:  int   = 640
     frame_height: int   = 480
     target_fps:   float = 15.0       # depth inference target
-    depth_scale:  float = 1.0        # multiplier for depth values
+    metric:       bool  = True       # True → raw metres output; False → normalise [0,1]
 
 
 # ── depth estimator ───────────────────────────────────────────────────────────
