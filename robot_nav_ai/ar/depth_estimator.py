@@ -83,23 +83,26 @@ class DepthEstimator:
 
         Returns
         -------
-        depth_norm : H×W float32 array, values in [0, 1]
-                     0 = furthest point, 1 = closest point
+        If cfg.metric=True  → H×W float32, values in metres (positive = distance)
+        If cfg.metric=False → H×W float32, values in [0, 1]  (1=close, 0=far)
         """
         rgb   = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         pil   = Image.fromarray(rgb)
         out   = self._pipe(pil)
         depth = np.array(out["depth"], dtype=np.float32)
 
-        # Normalise to [0, 1]
-        d_min, d_max = depth.min(), depth.max()
-        if d_max - d_min > 1e-6:
-            depth = (depth - d_min) / (d_max - d_min)
-        else:
-            depth = np.zeros_like(depth)
+        if not self.cfg.metric:
+            # Relative model: normalise to [0, 1] with 1=closest
+            d_min, d_max = depth.min(), depth.max()
+            if d_max - d_min > 1e-6:
+                depth = (depth - d_min) / (d_max - d_min)
+            else:
+                depth = np.zeros_like(depth)
+        # Metric model: depth is already in metres — no transformation needed
 
         # Resize to match input frame size
-        depth = cv2.resize(depth, (frame_bgr.shape[1], frame_bgr.shape[0]))
+        depth = cv2.resize(depth, (frame_bgr.shape[1], frame_bgr.shape[0]),
+                           interpolation=cv2.INTER_LINEAR)
         return depth
 
     def open_camera(self) -> None:
