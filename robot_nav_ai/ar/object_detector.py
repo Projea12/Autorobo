@@ -70,106 +70,198 @@ class Detection:
         return f"{self.label}{tid} {self.confidence:.0%} @ ({u},{v})"
 
 
-# ── IoU centroid tracker ───────────────────────────────────────────────────────
+# ── per-track Kalman filter ───────────────────────────────────────────────────
+
+class _KalmanBox:
+    """
+    Constant-velocity Kalman filter for one bounding box.
+
+    State  x = [cx, cy, w, h, vx, vy, vw, vh]  (8-D)
+    Obs    z = [cx, cy, w, h]                   (4-D)
+    """
+
+    def __init__(self, bbox: Tuple[int,int,int,int]) -> None:
+        cx, cy, w, h = _bbox_to_cwh(bbox)
+
+        # Transition matrix (constant velocity)
+        self.F = np.eye(8, dtype=np.float32)
+        for i in range(4):
+            self.F[i, i+4] = 1.0
+
+        # Observation matrix
+        self.H = np.eye(4, 8, dtype=np.float32)
+
+        # Noise
+        self.Q = np.diag([1,1,1,1, 10,10,5,5]).astype(np.float32)   # process
+        self.R = np.diag([4,4,16,16]).astype(np.float32)             # measurement
+
+        self.P = np.diag([10,10,20,20, 100,100,50,50]).astype(np.float32)
+
+        self.x = np.array([cx,cy,w,h, 0,0,0,0], dtype=np.float32)
+
+    def predict(self) -> Tuple[float,float,float,float]:
+        self.x = self.F @ self.x
+        self.P = self.F @ self.P @ self.F.T + self.Q
+        cx,cy,w,h = self.x[:4]
+        return cx,cy,max(1,w),max(1,h)
+
+    def update(self, bbox: Tuple[int,int,int,int]) -> None:
+        z = np.array(_bbox_to_cwh(bbox), dtype=np.float32)
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+        self.x = self.x + K @ (z - self.H @ self.x)
+        self.P = (np.eye(8) - K @ self.H) @ self.P
+
+    @property
+    def predicted_bbox(self) -> Tuple[int,int,int,int]:
+        cx,cy,w,h = self.x[:4]
+        return _cwh_to_bbox(cx,cy,w,h)
+
+
+# ── Kalman multi-object tracker ───────────────────────────────────────────────
 
 class IoUTracker:
     """
-    Assigns stable integer track IDs to detections across frames.
+    Kalman-filter-based multi-object tracker.
 
-    Algorithm (greedy IoU matching):
-      1. Compute IoU between every new detection and every live track.
-      2. Greedily match highest-IoU pairs (IoU > iou_thresh).
-      3. Matched tracks keep their ID.
-      4. Unmatched new detections get a fresh ID.
-      5. Tracks unseen for max_age frames are removed.
+    Each track has its own Kalman filter that predicts where the object
+    will appear next frame.  Detections are matched against PREDICTIONS
+    (not last observed positions) — this survives fast camera motion and
+    noisy YOLO bounding boxes.
 
-    Same-label constraint: only match detections to tracks of the same class
-    so a bottle never steals a cup's ID.
+    Same-label constraint: a bottle can never steal a cup's ID.
+    Two-stage matching:
+      Stage 1 — high-confidence IoU (≥ iou_hi) against predicted boxes
+      Stage 2 — centroid distance fallback for remaining pairs
     """
 
     def __init__(
         self,
-        iou_thresh:  float = 0.15,   # low because camera moves (boxes shift)
-        dist_thresh: float = 80.0,   # px — fallback when IoU=0 but object nearby
-        max_age:     int   = 12,     # frames to keep a track alive without a match
+        iou_hi:      float = 0.20,   # strong IoU match threshold
+        dist_thresh: float = 120.0,  # px fallback centroid distance
+        max_age:     int   = 15,     # frames to keep an unmatched track
+        min_hits:    int   = 2,      # detections needed before track is confirmed
     ) -> None:
-        self._iou_thresh  = iou_thresh
+        self._iou_hi      = iou_hi
         self._dist_thresh = dist_thresh
         self._max_age     = max_age
+        self._min_hits    = min_hits
         self._next_id     = 0
+        # tid → {kf, label, age, hits, confirmed}
         self._tracks: dict[int, dict] = {}
 
+    # ── public ────────────────────────────────────────────────────────────────
+
     def update(self, detections: List[Detection]) -> List[Detection]:
-        """Assign / update track IDs. Returns detections with track_id set."""
-        if not detections:
-            # Age out all tracks
-            for tid in list(self._tracks):
+        """Match detections to tracks, update Kalman filters, return detections
+        with stable track_id.  Unconfirmed tracks (< min_hits) are hidden."""
+
+        # Step 1 — predict all tracks one step forward
+        predictions: dict[int, Tuple] = {}
+        for tid, trk in self._tracks.items():
+            predictions[tid] = trk["kf"].predict()
+
+        live_ids = list(self._tracks.keys())
+        matched_det: dict[int, int] = {}   # det_idx → tid
+        matched_trk: set[int]       = set()
+
+        if detections and live_ids:
+            # Stage 1: high-confidence IoU against predicted bbox
+            pred_boxes = {tid: trk["kf"].predicted_bbox
+                          for tid, trk in self._tracks.items()}
+            score = self._build_score(detections, live_ids, pred_boxes, iou_weight=2.0)
+            matched_det, matched_trk = self._greedy_match(
+                score, detections, live_ids, matched_det, matched_trk, thresh=self._iou_hi
+            )
+
+            # Stage 2: centroid distance for remaining pairs
+            remaining_dets = [i for i in range(len(detections)) if i not in matched_det]
+            remaining_trks = [j for j, tid in enumerate(live_ids) if j not in matched_trk]
+            if remaining_dets and remaining_trks:
+                score2 = self._build_dist_score(
+                    detections, remaining_dets,
+                    live_ids, remaining_trks, pred_boxes
+                )
+                matched_det, matched_trk = self._greedy_match(
+                    score2, detections, live_ids, matched_det, matched_trk, thresh=0.01
+                )
+
+        # Step 2 — update matched tracks
+        for det_i, tid in matched_det.items():
+            self._tracks[tid]["kf"].update(detections[det_i].bbox_xyxy)
+            self._tracks[tid]["age"]  = 0
+            self._tracks[tid]["hits"] += 1
+            if self._tracks[tid]["hits"] >= self._min_hits:
+                self._tracks[tid]["confirmed"] = True
+            detections[det_i].track_id = tid
+
+        # Step 3 — new tracks for unmatched detections
+        for i, det in enumerate(detections):
+            if i not in matched_det:
+                tid = self._next_id
+                self._tracks[tid] = {
+                    "kf":        _KalmanBox(det.bbox_xyxy),
+                    "label":     det.label,
+                    "age":       0,
+                    "hits":      1,
+                    "confirmed": False,
+                }
+                det.track_id   = tid
+                self._next_id += 1
+
+        # Step 4 — age out dead tracks
+        for tid in list(self._tracks):
+            if tid not in matched_det.values():
                 self._tracks[tid]["age"] += 1
                 if self._tracks[tid]["age"] > self._max_age:
                     del self._tracks[tid]
-            return []
 
-        live_ids  = list(self._tracks.keys())
-        det_boxes = [d.bbox_xyxy for d in detections]
-        trk_boxes = [self._tracks[t]["bbox"] for t in live_ids]
+        # Only return confirmed tracks (suppress single-frame noise)
+        return [d for d in detections
+                if d.track_id in self._tracks
+                and self._tracks[d.track_id]["confirmed"]]
 
-        # Score matrix: rows=detections, cols=tracks
-        # Score = IoU (preferred) or inverse centroid distance (fallback)
-        score_mat = np.zeros((len(detections), len(live_ids)), dtype=np.float32)
-        for i, db in enumerate(det_boxes):
-            for j, tb in enumerate(trk_boxes):
-                if detections[i].label != self._tracks[live_ids[j]]["label"]:
+    # ── internals ─────────────────────────────────────────────────────────────
+
+    def _build_score(self, dets, live_ids, pred_boxes, iou_weight=1.0):
+        n, m = len(dets), len(live_ids)
+        score = np.zeros((n, m), np.float32)
+        for i, det in enumerate(dets):
+            for j, tid in enumerate(live_ids):
+                if det.label != self._tracks[tid]["label"]:
                     continue
-                iou_val = _iou(db, tb)
-                if iou_val >= self._iou_thresh:
-                    score_mat[i, j] = iou_val + 1.0   # prefer IoU matches
-                else:
-                    # Centroid distance fallback
-                    dc = detections[i].centroid_uv
-                    tc = self._tracks[live_ids[j]]["centroid"]
-                    dist = ((dc[0]-tc[0])**2 + (dc[1]-tc[1])**2) ** 0.5
-                    if dist < self._dist_thresh:
-                        score_mat[i, j] = max(0.0, 1.0 - dist / self._dist_thresh)
+                score[i, j] = _iou(det.bbox_xyxy, pred_boxes[tid]) * iou_weight
+        return score
 
-        matched_det  = set()
-        matched_trk  = set()
+    def _build_dist_score(self, dets, det_idxs, live_ids, trk_idxs, pred_boxes):
+        n, m = len(dets), len(live_ids)
+        score = np.zeros((n, m), np.float32)
+        for i in det_idxs:
+            det = dets[i]
+            dc  = det.centroid_uv
+            for j in trk_idxs:
+                tid = live_ids[j]
+                if det.label != self._tracks[tid]["label"]:
+                    continue
+                pb  = pred_boxes[tid]
+                tc  = ((pb[0]+pb[2])//2, (pb[1]+pb[3])//2)
+                dist = ((dc[0]-tc[0])**2 + (dc[1]-tc[1])**2) ** 0.5
+                if dist < self._dist_thresh:
+                    score[i, j] = 1.0 - dist / self._dist_thresh
+        return score
 
-        # Greedy: match highest score pairs first
-        flat = np.argsort(-score_mat, axis=None)
+    @staticmethod
+    def _greedy_match(score, dets, live_ids, matched_det, matched_trk, thresh):
+        flat = np.argsort(-score, axis=None)
         for idx in flat:
             i, j = divmod(int(idx), len(live_ids))
-            if score_mat[i, j] <= 0:
+            if score[i, j] < thresh:
                 break
             if i in matched_det or j in matched_trk:
                 continue
-            tid = live_ids[j]
-            detections[i].track_id = tid
-            self._tracks[tid]["bbox"]     = det_boxes[i]
-            self._tracks[tid]["centroid"] = detections[i].centroid_uv
-            self._tracks[tid]["age"]      = 0
-            matched_det.add(i)
+            matched_det[i] = live_ids[j]
             matched_trk.add(j)
-
-        # New tracks for unmatched detections
-        for i, det in enumerate(detections):
-            if i not in matched_det:
-                det.track_id = self._next_id
-                self._tracks[self._next_id] = {
-                    "bbox":     det.bbox_xyxy,
-                    "centroid": det.centroid_uv,
-                    "label":    det.label,
-                    "age":      0,
-                }
-                self._next_id += 1
-
-        # Age out unmatched tracks
-        for j, tid in enumerate(live_ids):
-            if j not in matched_trk:
-                self._tracks[tid]["age"] += 1
-                if self._tracks[tid]["age"] > self._max_age:
-                    del self._tracks[tid]
-
-        return detections
+        return matched_det, matched_trk
 
 
 # ── Detector ──────────────────────────────────────────────────────────────────
@@ -227,7 +319,7 @@ class ObjectDetector:
         # Colours per track ID (stable colour = stable ID)
         self._colours: dict[int, Tuple[int,int,int]] = {}
         self._target_label: Optional[str] = None
-        self._tracker = IoUTracker(iou_thresh=0.15, dist_thresh=80.0, max_age=12)
+        self._tracker = IoUTracker(iou_hi=0.20, dist_thresh=120.0, max_age=15, min_hits=2)
         print("[detector] Ready.")
 
     # ── public API ────────────────────────────────────────────────────────────
@@ -450,6 +542,13 @@ _SYNONYMS: dict[str, list] = {
 _STRIP = {"pick", "up", "grab", "get", "fetch", "bring", "take",
           "the", "a", "an", "that", "this", "please", "me", "for", "i"}
 
+
+def _bbox_to_cwh(b):
+    """xyxy → (cx, cy, w, h)"""
+    return (b[0]+b[2])/2, (b[1]+b[3])/2, b[2]-b[0], b[3]-b[1]
+
+def _cwh_to_bbox(cx, cy, w, h):
+    return (int(cx-w/2), int(cy-h/2), int(cx+w/2), int(cy+h/2))
 
 def _iou(a: Tuple[int,int,int,int], b: Tuple[int,int,int,int]) -> float:
     """Intersection-over-Union of two boxes [x1,y1,x2,y2]."""
