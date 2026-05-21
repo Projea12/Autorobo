@@ -484,26 +484,28 @@ class ObjectDetector:
                 self._fps = 1.0 / elapsed if elapsed > 0 else 0.0
 
     def _parse(self, result) -> List[Detection]:
-        dets = []
         boxes = result.boxes
         if boxes is None or len(boxes.cls) == 0:
-            return dets
+            return []
 
         xyxy  = boxes.xyxy.cpu().numpy().astype(int)
         confs = boxes.conf.cpu().numpy()
         clses = boxes.cls.cpu().numpy().astype(int)
 
+        raw = []
         for (x1, y1, x2, y2), conf, cls in zip(xyxy, confs, clses):
             label = self._model.names[cls]
             cx    = int((x1 + x2) / 2)
             cy    = int((y1 + y2) / 2)
-            dets.append(Detection(
+            raw.append(Detection(
                 label       = label,
                 confidence  = float(conf),
                 bbox_xyxy   = (x1, y1, x2, y2),
                 centroid_uv = (cx, cy),
             ))
-        return dets
+
+        # Per-label NMS: suppress overlapping boxes of the same class
+        return _label_nms(raw, iou_thresh=0.40)
 
     def _track_colour(self, track_id: int) -> Tuple[int, int, int]:
         """Stable colour per track ID — same object always same colour."""
@@ -541,6 +543,31 @@ _SYNONYMS: dict[str, list] = {
 # Words to strip from natural language commands
 _STRIP = {"pick", "up", "grab", "get", "fetch", "bring", "take",
           "the", "a", "an", "that", "this", "please", "me", "for", "i"}
+
+
+def _label_nms(dets: List[Detection], iou_thresh: float = 0.40) -> List[Detection]:
+    """
+    Per-label Non-Maximum Suppression.
+    Within each label, suppress lower-confidence boxes that overlap
+    a higher-confidence box by more than iou_thresh.
+    This prevents YOLO-World from creating 3 'bed' tracks for one bed.
+    """
+    by_label: dict[str, List[Detection]] = {}
+    for d in dets:
+        by_label.setdefault(d.label, []).append(d)
+
+    kept = []
+    for label, group in by_label.items():
+        group.sort(key=lambda d: -d.confidence)
+        suppressed = set()
+        for i, d in enumerate(group):
+            if i in suppressed:
+                continue
+            kept.append(d)
+            for j in range(i + 1, len(group)):
+                if j not in suppressed and _iou(d.bbox_xyxy, group[j].bbox_xyxy) > iou_thresh:
+                    suppressed.add(j)
+    return kept
 
 
 def _bbox_to_cwh(b):
