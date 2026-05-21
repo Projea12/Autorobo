@@ -87,11 +87,16 @@ class IoUTracker:
     so a bottle never steals a cup's ID.
     """
 
-    def __init__(self, iou_thresh: float = 0.30, max_age: int = 8) -> None:
-        self._iou_thresh = iou_thresh
-        self._max_age    = max_age
-        self._next_id    = 0
-        # track_id → {bbox, label, age (frames since last seen)}
+    def __init__(
+        self,
+        iou_thresh:  float = 0.15,   # low because camera moves (boxes shift)
+        dist_thresh: float = 80.0,   # px — fallback when IoU=0 but object nearby
+        max_age:     int   = 12,     # frames to keep a track alive without a match
+    ) -> None:
+        self._iou_thresh  = iou_thresh
+        self._dist_thresh = dist_thresh
+        self._max_age     = max_age
+        self._next_id     = 0
         self._tracks: dict[int, dict] = {}
 
     def update(self, detections: List[Detection]) -> List[Detection]:
@@ -108,21 +113,32 @@ class IoUTracker:
         det_boxes = [d.bbox_xyxy for d in detections]
         trk_boxes = [self._tracks[t]["bbox"] for t in live_ids]
 
-        # IoU matrix: rows=detections, cols=tracks
-        iou_mat = np.zeros((len(detections), len(live_ids)), dtype=np.float32)
+        # Score matrix: rows=detections, cols=tracks
+        # Score = IoU (preferred) or inverse centroid distance (fallback)
+        score_mat = np.zeros((len(detections), len(live_ids)), dtype=np.float32)
         for i, db in enumerate(det_boxes):
             for j, tb in enumerate(trk_boxes):
-                if detections[i].label == self._tracks[live_ids[j]]["label"]:
-                    iou_mat[i, j] = _iou(db, tb)
+                if detections[i].label != self._tracks[live_ids[j]]["label"]:
+                    continue
+                iou_val = _iou(db, tb)
+                if iou_val >= self._iou_thresh:
+                    score_mat[i, j] = iou_val + 1.0   # prefer IoU matches
+                else:
+                    # Centroid distance fallback
+                    dc = detections[i].centroid_uv
+                    tc = self._tracks[live_ids[j]]["centroid"]
+                    dist = ((dc[0]-tc[0])**2 + (dc[1]-tc[1])**2) ** 0.5
+                    if dist < self._dist_thresh:
+                        score_mat[i, j] = max(0.0, 1.0 - dist / self._dist_thresh)
 
         matched_det  = set()
         matched_trk  = set()
 
-        # Greedy: match highest IoU pairs first
-        flat = np.argsort(-iou_mat, axis=None)
+        # Greedy: match highest score pairs first
+        flat = np.argsort(-score_mat, axis=None)
         for idx in flat:
             i, j = divmod(int(idx), len(live_ids))
-            if iou_mat[i, j] < self._iou_thresh:
+            if score_mat[i, j] <= 0:
                 break
             if i in matched_det or j in matched_trk:
                 continue
