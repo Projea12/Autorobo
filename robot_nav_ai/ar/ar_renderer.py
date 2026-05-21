@@ -322,6 +322,13 @@ class ARRenderer:
 
     def _render_sprite(self) -> None:
         """Offscreen-render robot and extract robot-only pixels."""
+        # Keep sprite camera locked onto the robot's current base position so
+        # base motion (joint_x / joint_y) never walks the robot out of frame.
+        bx = float(self._data.qpos[0])
+        by = float(self._data.qpos[1])
+        self._sprite_cam.lookat[0] = bx
+        self._sprite_cam.lookat[1] = by
+
         self._renderer.update_scene(
             self._data, camera=self._sprite_cam, scene_option=self._opt
         )
@@ -332,7 +339,7 @@ class ARRenderer:
         self._renderer.update_scene(
             self._data, camera=self._sprite_cam, scene_option=self._opt
         )
-        self._set_frustum()
+        self._set_frustum()   # reapply after second update_scene
         depth = self._renderer.render().copy()
         self._renderer.disable_depth_rendering()
 
