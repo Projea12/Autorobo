@@ -41,7 +41,7 @@ Usage
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -108,3 +108,40 @@ Transform a point from camera frame to robot base frame:
 For a forward-facing camera with no tilt, an object directly on the
 optical axis at depth d maps to Y_base ≈ d  (forward distance from robot).
 """
+
+# Inverse: base frame → camera frame  (P_cam = R^T · (P_base − t))
+T_BASE_TO_CAM = RigidTransform(
+    R = _R_CAM_TO_BASE.T,
+    t = -_R_CAM_TO_BASE.T @ _T_CAM_IN_BASE,
+)
+
+
+def project_to_pixel(
+    xyz_base: Tuple[float, float, float],
+    intrinsics,
+) -> Optional[Tuple[int, int]]:
+    """
+    Project a 3D point in robot base frame to a 2D image pixel.
+
+    Pipeline:
+        1. base frame → camera frame  (T_BASE_TO_CAM)
+        2. pin-hole projection:  u = fx·X/Z + cx,  v = fy·Y/Z + cy
+
+    Returns None if the point is behind the camera (Z_cam ≤ 0).
+
+    Parameters
+    ----------
+    xyz_base   : (3,) point in robot base frame
+    intrinsics : object with .fx .fy .cx .cy
+
+    Returns
+    -------
+    (u, v) pixel coordinates, or None if behind camera
+    """
+    xyz_cam = T_BASE_TO_CAM(xyz_base)
+    Z = xyz_cam[2]
+    if Z <= 1e-4:
+        return None
+    u = int(round(intrinsics.fx * xyz_cam[0] / Z + intrinsics.cx))
+    v = int(round(intrinsics.fy * xyz_cam[1] / Z + intrinsics.cy))
+    return (u, v)

@@ -52,8 +52,9 @@ Usage
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
+import cv2
 import numpy as np
 
 from ar.grasp_pose import ApproachType, GraspApproach
@@ -189,3 +190,87 @@ class GraspPlanner:
             approach_type = approach.approach_type,
             object_xyz    = obj.copy(),
         )
+
+
+# ── visualisation ─────────────────────────────────────────────────────────────
+
+def draw_grasp(
+    frame:      np.ndarray,
+    pose:       GraspPose,
+    intrinsics,
+    colour_pre: Tuple[int,int,int] = (0, 200, 255),   # cyan  — pre-grasp
+    colour_grs: Tuple[int,int,int] = (0, 255,  80),   # green — grasp
+) -> np.ndarray:
+    """
+    Project the grasp pose into the image and draw an annotated arrow.
+
+    Draws:
+      • Dashed circle at object centroid
+      • Filled circle at projected grasp point  (green)
+      • Filled circle at projected pre-grasp    (cyan)
+      • Arrow from pre-grasp → grasp (shows approach direction)
+      • Label: approach type + distance to object
+
+    The arrow points in the direction the gripper travels:
+        Top-down   → arrow points downward  in image (Y increases)
+        Horizontal → arrow points toward    image centre (depth decreases)
+
+    Parameters
+    ----------
+    frame      : BGR video frame to draw on (modified in-place)
+    pose       : GraspPose from GraspPlanner.plan()
+    intrinsics : CameraIntrinsics (.fx .fy .cx .cy)
+
+    Returns
+    -------
+    frame (same object, modified in-place)
+    """
+    from ar.transforms import project_to_pixel
+
+    # Project all three points
+    px_obj = project_to_pixel(pose.object_xyz,    intrinsics)
+    px_pre = project_to_pixel(pose.pre_grasp_xyz, intrinsics)
+    px_grs = project_to_pixel(pose.grasp_xyz,     intrinsics)
+
+    if None in (px_obj, px_pre, px_grs):
+        return frame   # point(s) behind camera — skip
+
+    H, W = frame.shape[:2]
+
+    def _in_frame(px):
+        return 0 <= px[0] < W and 0 <= px[1] < H
+
+    # Object centroid ring
+    if _in_frame(px_obj):
+        cv2.circle(frame, px_obj, 10, colour_grs, 2, cv2.LINE_AA)
+
+    # Arrow: pre-grasp → grasp  (approach direction)
+    if _in_frame(px_pre) and _in_frame(px_grs):
+        cv2.arrowedLine(frame, px_pre, px_grs,
+                        (255, 255, 255), 3, cv2.LINE_AA, tipLength=0.35)
+        cv2.arrowedLine(frame, px_pre, px_grs,
+                        colour_pre, 2, cv2.LINE_AA, tipLength=0.35)
+
+    # Pre-grasp dot
+    if _in_frame(px_pre):
+        cv2.circle(frame, px_pre, 6, colour_pre, -1, cv2.LINE_AA)
+        cv2.circle(frame, px_pre, 6, (0, 0, 0),   1, cv2.LINE_AA)
+
+    # Grasp dot
+    if _in_frame(px_grs):
+        cv2.circle(frame, px_grs, 6, colour_grs, -1, cv2.LINE_AA)
+        cv2.circle(frame, px_grs, 6, (0, 0, 0),   1, cv2.LINE_AA)
+
+    # Label near pre-grasp point
+    dist_m = float(np.linalg.norm(pose.object_xyz))
+    label  = f"{pose.approach_type.value}  {dist_m:.2f}m"
+    lx     = max(px_pre[0] + 8, 4)
+    ly     = max(px_pre[1] - 8, 14)
+    cv2.putText(frame, label, (lx, ly),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.44,
+                (0, 0, 0), 3, cv2.LINE_AA)
+    cv2.putText(frame, label, (lx, ly),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.44,
+                colour_pre, 1, cv2.LINE_AA)
+
+    return frame
