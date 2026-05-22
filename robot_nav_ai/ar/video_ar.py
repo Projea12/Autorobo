@@ -436,9 +436,11 @@ def main() -> None:
 
     # ── click-to-grasp state ──────────────────────────────────────────────────
     # _click_state[0] = (u_frame, v_frame) in original frame coords, or None.
+    # _click_xyz[0]   = (X, Y, Z) in robot base frame, or None.
     # _display_dims[0] = (disp_w, disp_h) — updated each frame so the callback
     # can scale display-space clicks back to frame space correctly.
     _click_state:   list = [None]   # [(u, v)] | [None]
+    _click_xyz:     list = [None]   # [(X, Y, Z) base frame] | [None]
     _display_dims:  list = [(W, H)]
 
     WIN = "Autorobo — TidyBot Navigation (Q to quit)"
@@ -526,16 +528,45 @@ def main() -> None:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                         (0, 0, 0), 1, cv2.LINE_AA)
 
-            # Draw click-to-grasp crosshair
+            # Pixel → 3D unproject for clicked point
+            click = _click_state[0]
+            if click is not None and use_depth and localiser is not None:
+                depth_map = localiser.latest_depth()
+                if depth_map is not None:
+                    cu, cv_ = click
+                    dh_dm, dw_dm = depth_map.shape[:2]
+                    # Clamp to depth map dimensions (may differ from frame)
+                    su = int(cu * dw_dm / W)
+                    sv = int(cv_ * dh_dm / H)
+                    su = max(0, min(dw_dm - 1, su))
+                    sv = max(0, min(dh_dm - 1, sv))
+                    d  = float(depth_map[sv, su])
+                    if d > 0.05:   # ignore zero / near-zero depth
+                        xyz_cam  = Localiser.back_project(cu, cv_, d, ar_cfg.intrinsics)
+                        xyz_base = Localiser.to_base_frame(xyz_cam)
+                        _click_xyz[0] = xyz_base
+                    else:
+                        _click_xyz[0] = None
+
+            # Draw click-to-grasp crosshair + 3D label
             click = _click_state[0]
             if click is not None:
                 cu, cv_ = click
-                r = 18
-                cv2.circle(out, (cu, cv_), r, (0, 255, 255), 2, cv2.LINE_AA)
-                cv2.line(out, (cu - r, cv_), (cu + r, cv_), (0, 255, 255), 1, cv2.LINE_AA)
-                cv2.line(out, (cu, cv_ - r), (cu, cv_ + r), (0, 255, 255), 1, cv2.LINE_AA)
-                cv2.putText(out, "CLICK TO GRASP", (cu + r + 4, cv_ + 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+                r    = 18
+                xyz  = _click_xyz[0]
+                col  = (0, 255, 255)   # cyan until reachability known
+                cv2.circle(out, (cu, cv_), r, col, 2, cv2.LINE_AA)
+                cv2.line(out, (cu - r, cv_), (cu + r, cv_), col, 1, cv2.LINE_AA)
+                cv2.line(out, (cu, cv_ - r), (cu, cv_ + r), col, 1, cv2.LINE_AA)
+                if xyz is not None:
+                    label3d = (f"({xyz[0]:+.2f}, {xyz[1]:+.2f}, {xyz[2]:.2f}) m")
+                    cv2.putText(out, label3d, (cu + r + 4, cv_ - 6),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 0, 0), 3, cv2.LINE_AA)
+                    cv2.putText(out, label3d, (cu + r + 4, cv_ - 6),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.46, col, 1, cv2.LINE_AA)
+                else:
+                    cv2.putText(out, "NO DEPTH", (cu + r + 4, cv_ - 6),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 100, 255), 1, cv2.LINE_AA)
 
             # Scale up for display
             disp_h  = 720
