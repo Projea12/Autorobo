@@ -434,9 +434,37 @@ def main() -> None:
     # ── fixed robot position ──────────────────────────────────────────────────
     u, v, sprite_h = robot_screen_pos(W, H)
 
+    # ── click-to-grasp state ──────────────────────────────────────────────────
+    # _click_state[0] = (u_frame, v_frame) in original frame coords, or None.
+    # _display_dims[0] = (disp_w, disp_h) — updated each frame so the callback
+    # can scale display-space clicks back to frame space correctly.
+    _click_state:   list = [None]   # [(u, v)] | [None]
+    _display_dims:  list = [(W, H)]
+
+    WIN = "Autorobo — TidyBot Navigation (Q to quit)"
+    cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
+
+    def _on_mouse(event, cx, cy, flags, param) -> None:
+        """Convert display-space click → frame-space pixel and store it."""
+        if event == cv2.EVENT_LBUTTONDOWN:
+            dw, dh = _display_dims[0]
+            # Scale from display resolution back to original frame resolution
+            fx = int(cx * W / dw)
+            fy = int(cy * H / dh)
+            fx = max(0, min(W - 1, fx))
+            fy = max(0, min(H - 1, fy))
+            _click_state[0] = (fx, fy)
+            print(f"[click] pixel ({fx}, {fy})  →  queued for grasp")
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            _click_state[0] = None
+            print("[click] cleared")
+
+    cv2.setMouseCallback(WIN, _on_mouse)
+
     print("\n[video_ar] Ready.  TidyBot loaded.\n")
     print("           forward / back / left / right / stop")
-    print("           arm up / arm down / open / close / wave / home / quit\n")
+    print("           arm up / arm down / open / close / wave / home / quit")
+    print("           LEFT CLICK on any object to pick it up\n")
 
     try:
         while not quit_event.is_set():
@@ -498,12 +526,24 @@ def main() -> None:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                         (0, 0, 0), 1, cv2.LINE_AA)
 
-            # Scale up for display
-            dh      = 720
-            dw      = int(out.shape[1] * dh / out.shape[0])
-            display = cv2.resize(out, (dw, dh))
+            # Draw click-to-grasp crosshair
+            click = _click_state[0]
+            if click is not None:
+                cu, cv_ = click
+                r = 18
+                cv2.circle(out, (cu, cv_), r, (0, 255, 255), 2, cv2.LINE_AA)
+                cv2.line(out, (cu - r, cv_), (cu + r, cv_), (0, 255, 255), 1, cv2.LINE_AA)
+                cv2.line(out, (cu, cv_ - r), (cu, cv_ + r), (0, 255, 255), 1, cv2.LINE_AA)
+                cv2.putText(out, "CLICK TO GRASP", (cu + r + 4, cv_ + 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
 
-            cv2.imshow("Autorobo — TidyBot Navigation (Q to quit)", display)
+            # Scale up for display
+            disp_h  = 720
+            disp_w  = int(out.shape[1] * disp_h / out.shape[0])
+            display = cv2.resize(out, (disp_w, disp_h))
+            _display_dims[0] = (disp_w, disp_h)
+
+            cv2.imshow(WIN, display)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
