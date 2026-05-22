@@ -738,33 +738,33 @@ def main() -> None:
                         d  = float(depth_map[sv, su])
                         if d > 0.05:
                             xyz_cam  = Localiser.back_project(cu, cv_, d, ar_cfg.intrinsics)
-                            xyz_base = Localiser.to_base_frame(xyz_cam)
+                            _candidate = Localiser.to_base_frame(xyz_cam)
+                            if _kin.is_reachable(_candidate):
+                                xyz_base = _candidate
 
-                # Fallback: snap to nearest YOLO detection with known 3D position
-                if xyz_base is None and use_detect and detector is not None:
-                    dets = detector.latest
-                    if dets and use_depth and localiser is not None:
-                        depth_map = localiser.latest_depth()
-                        if depth_map is not None:
-                            xyz_list = localiser.localise(dets, depth_map, ar_cfg.intrinsics)
-                            best_dist, best_xyz = float("inf"), None
-                            for det, xyz in zip(dets, xyz_list):
-                                if xyz is None:
-                                    continue
-                                uc, vc = det.centroid_uv
-                                d2 = (cu - uc) ** 2 + (cv_ - vc) ** 2
-                                if d2 < best_dist:
-                                    best_dist, best_xyz = d2, xyz
-                            if best_xyz is not None and best_dist < (150 ** 2):
-                                xyz_base = best_xyz
-                                print(f"[click] snapped to nearest detection  xyz={tuple(round(x,3) for x in xyz_base)}")
+                # Fallback: ray-march along click ray to find nearest reachable depth.
+                # The camera is at 1.2m looking horizontally — objects the arm can
+                # reach are below the camera horizon and only visible at close range.
+                # Scanning d from 0.8m down to 0.15m finds the reachable depth (if any)
+                # along this pixel's view ray without needing the depth estimator.
+                if xyz_base is None:
+                    for _d in np.linspace(0.8, 0.15, 14):
+                        _xyz_cam  = Localiser.back_project(cu, cv_, _d, ar_cfg.intrinsics)
+                        _candidate = Localiser.to_base_frame(_xyz_cam)
+                        if _kin.is_reachable(_candidate):
+                            xyz_base = _candidate
+                            print(f"[click] ray-march found reachable depth {_d:.2f}m  "
+                                  f"xyz={tuple(round(x,3) for x in xyz_base)}")
+                            break
 
                 if xyz_base is not None:
                     _click_xyz[0]       = xyz_base
-                    _click_reachable[0] = _kin.is_reachable(xyz_base)
+                    _click_reachable[0] = True
                 else:
-                    _click_xyz[0]       = None
-                    _click_reachable[0] = None
+                    # No reachable depth along this ray — upper frame / too far
+                    _xyz_cam  = Localiser.back_project(cu, cv_, 0.8, ar_cfg.intrinsics)
+                    _click_xyz[0]       = Localiser.to_base_frame(_xyz_cam)
+                    _click_reachable[0] = False
 
             # Trigger IK + plan when click lands on a new reachable point
             _c  = _click_state[0]
