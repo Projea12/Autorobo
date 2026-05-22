@@ -516,6 +516,58 @@ def main() -> None:
     _last_planned_click: list = [None]   # (u,v) of last triggered plan
     _plan_thread:        list = [None]   # threading.Thread | None
 
+    # Execute state — populated by _run_grasp_click() background thread
+    _exec_running:      list = [False]
+    _exec_status:       list = [""]
+    _exec_banner_until: list = [0.0]   # time.time() deadline for banner hold
+    _exec_banner_col:   list = [(0, 0, 0)]
+    _exec_trigger:      list = [False]
+
+    def _run_grasp_click(pose) -> None:
+        """Run full GraspExecutor pipeline in a daemon thread for a clicked point."""
+        from robot.kinematics       import TidyBotKinematics
+        from robot.robot_controller import RobotController
+        from ar.grasp_executor      import GraspExecutor
+        from ar.grasp_reporter      import GraspReporter
+
+        _exec_running[0] = True
+        _exec_status[0]  = "STARTING GRASP..."
+        try:
+            kin2     = TidyBotKinematics()
+            ctrl2    = RobotController(kin2)
+            executor = GraspExecutor(ctrl2, kin2)
+
+            # Intercept state transitions for live overlay
+            orig = executor._transition
+            def _tracked(new_state):
+                orig(new_state)
+                _exec_status[0] = GraspSession._STATE_LABELS.get(
+                    new_state.name, new_state.name)
+            executor._transition = _tracked
+
+            result       = executor.execute(pose)
+            grasp_result = GraspReporter().report(result, label="object")
+
+            if grasp_result.success:
+                _exec_banner_col[0] = (0, 180, 0)
+                _exec_status[0]     = "SUCCESS — object secured  ✓"
+            else:
+                reason = (grasp_result.failure_reason.name
+                          .lower().replace("_", " ")
+                          if grasp_result.failure_reason else "unknown")
+                _exec_banner_col[0] = (0, 0, 180)
+                _exec_status[0]     = f"FAILED — {reason}  ✗"
+
+            _exec_banner_until[0] = time.time() + 3.0
+
+        except Exception as exc:
+            _exec_status[0]       = f"ERROR: {exc}"
+            _exec_banner_col[0]   = (0, 0, 180)
+            _exec_banner_until[0] = time.time() + 3.0
+            print(f"[click] execute error: {exc}")
+        finally:
+            _exec_running[0] = False
+
     def _launch_plan(xyz_base: tuple) -> None:
         """Run IK + GraspPlanner in a daemon thread for the clicked point."""
         from ar.grasp_planner import GraspPlanner
@@ -551,8 +603,15 @@ def main() -> None:
     def _on_mouse(event, cx, cy, flags, param) -> None:
         """Convert display-space click → frame-space pixel and store it."""
         if event == cv2.EVENT_LBUTTONDOWN:
+            # Second click when plan is ready → execute
+            if (_click_plan[0] is not None and
+                    "READY" in _click_plan_status[0] and
+                    not _exec_running[0]):
+                _exec_trigger[0] = True
+                print("[click] execute triggered")
+                return
+            # First click — set new target pixel
             dw, dh = _display_dims[0]
-            # Scale from display resolution back to original frame resolution
             fx = int(cx * W / dw)
             fy = int(cy * H / dh)
             fx = max(0, min(W - 1, fx))
@@ -613,12 +672,30 @@ def main() -> None:
             if use_slam and slam is not None:
                 slam.draw_minimap(out)
 
-            # Grasp status overlay (takes priority when session is active)
-            session = _grasp_session[0]
-            if session is not None and (session.running or session.status not in ("IDLE", "READY")):
-                _draw_grasp_status(out, session.status)
-                if not session.running:
-                    _grasp_session[0] = None   # clear after done
+            # Grasp status overlay — click-execute takes priority, then voice session
+            now = time.time()
+            if _exec_running[0]:
+                _draw_grasp_status(out, _exec_status[0])
+            elif now < _exec_banner_until[0]:
+                # Timed coloured result banner (3 s)
+                from ar.grasp_reporter import _draw_banner as _draw_col_banner
+                _draw_col_banner(out, _exec_status[0], _exec_banner_col[0])
+            elif _exec_banner_until[0] > 0 and now >= _exec_banner_until[0]:
+                # Banner expired — reset click pipeline for next pick
+                _exec_banner_until[0] = 0.0
+                _exec_status[0]       = ""
+                _click_state[0]       = None
+                _click_xyz[0]         = None
+                _click_reachable[0]   = None
+                _click_plan[0]        = None
+                _click_plan_status[0] = ""
+                _last_planned_click[0]= None
+            else:
+                session = _grasp_session[0]
+                if session is not None and (session.running or session.status not in ("IDLE", "READY")):
+                    _draw_grasp_status(out, session.status)
+                    if not session.running:
+                        _grasp_session[0] = None
 
             # Status overlay
             cmd_name = controller.current().name
@@ -670,6 +747,13 @@ def main() -> None:
                     target=_launch_plan, args=(_xb,), daemon=True
                 )
                 _plan_thread[0].start()
+
+            # Launch execution when user clicks again on a ready plan
+            if _exec_trigger[0] and not _exec_running[0] and _click_plan[0] is not None:
+                _exec_trigger[0] = False
+                threading.Thread(
+                    target=_run_grasp_click, args=(_click_plan[0],), daemon=True
+                ).start()
 
             # Trajectory arc overlay — shown whenever a plan is ready
             plan = _click_plan[0]
