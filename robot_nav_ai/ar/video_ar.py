@@ -634,11 +634,19 @@ def main() -> None:
     print("           arm up / arm down / open / close / wave / home / quit")
     print("           LEFT CLICK on any object to pick it up\n")
 
+    _last_frame: list = [None]   # hold last valid frame so pause doesn't break loop
+
     try:
         while not quit_event.is_set():
             frame = player.read()
             if frame is None:
-                break
+                # Paused or seek failed — reuse last frame so display keeps updating
+                if _cur_speed[0] == 0.0 and _last_frame[0] is not None:
+                    frame = _last_frame[0]
+                else:
+                    break
+            else:
+                _last_frame[0] = frame
 
             # Feed frame to SLAM, detector and localiser (non-blocking)
             if use_slam:
