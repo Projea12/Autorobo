@@ -1,5 +1,5 @@
 """
-robot/robot_controller.py — Low-level arm joint controller (Block 5.2).
+robot/robot_controller.py — Low-level arm joint controller (Blocks 5.2 / 5.3).
 
 Why a separate controller instead of using the existing ArmController
 ----------------------------------------------------------------------
@@ -44,8 +44,9 @@ Usage
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import numpy as np
 
@@ -71,6 +72,42 @@ _GRIPPER_ACT_IDX  = 10             # fingers_actuator index
 
 GRIPPER_OPEN:  float = 0.0
 GRIPPER_CLOSE: float = 200.0       # ≤ 255 to avoid over-squeeze
+
+# Gripper qpos indices (right_driver_joint, left_driver_joint)
+_RDRIVER_QPOS = 10
+_LDRIVER_QPOS = 14
+
+# Ramp defaults (Block 5.3)
+RAMP_STEPS:        int   = 50      # 50 steps @ 100 Hz = 0.5 s
+RESISTANCE_TOL:    float = 1e-3    # driver joint delta below which = "stuck"
+RESISTANCE_MIN_STEP: int = 5       # ignore first N steps (joint inertia)
+
+
+# ── gripper close result ──────────────────────────────────────────────────────
+
+@dataclass
+class GripperCloseResult:
+    """
+    Result of close_gripper_ramped().
+
+    Attributes
+    ----------
+    final_ctrl      : ctrl[10] value where the ramp stopped
+    steps_taken     : how many ramp steps were executed
+    object_detected : True if resistance stopped the ramp before target_ctrl
+    final_driver_pos: right_driver_joint qpos at end (radians, max ≈ 0.8)
+    """
+    final_ctrl:       float
+    steps_taken:      int
+    object_detected:  bool
+    final_driver_pos: float
+
+    def __str__(self) -> str:
+        status = "OBJECT DETECTED" if self.object_detected else "FREE CLOSE"
+        return (
+            f"GripperCloseResult [{status}]  ctrl={self.final_ctrl:.1f}/200  "
+            f"steps={self.steps_taken}  driver_pos={self.final_driver_pos:.3f} rad"
+        )
 
 
 # ── controller ────────────────────────────────────────────────────────────────
@@ -144,9 +181,79 @@ class RobotController:
         self._sync_to_mujoco()
 
     def close_gripper(self) -> None:
-        """Command gripper to close (ctrl = 200)."""
+        """Command gripper to close (ctrl = 200) instantly."""
         self._gripper = GRIPPER_CLOSE
         self._sync_to_mujoco()
+
+    def close_gripper_ramped(
+        self,
+        target_ctrl:      float = GRIPPER_CLOSE,
+        n_ramp_steps:     int   = RAMP_STEPS,
+        resistance_tol:   float = RESISTANCE_TOL,
+        min_steps:        int   = RESISTANCE_MIN_STEP,
+        _physics_step_fn: Optional[Callable] = None,
+    ) -> GripperCloseResult:
+        """
+        Ramp ctrl[10] from 0 → target_ctrl over n_ramp_steps.
+
+        Stops early if the right_driver_joint stops moving — indicating
+        an object is blocking the gripper fingers.
+
+        Why ramp, not instant
+        ----------------------
+        Instantaneous closing at full force can knock light objects out of
+        position.  A ramp lets the fingers make gentle contact first, then
+        increase force — the joint stagnates at the moment of contact,
+        giving a clean stop signal.
+
+        Parameters
+        ----------
+        target_ctrl    : final ctrl value (default 200)
+        n_ramp_steps   : total ramp steps  (default 50 → 0.5 s at 100 Hz)
+        resistance_tol : driver joint delta below this → "stuck" (default 1e-3)
+        min_steps      : ignore resistance check for first N steps (inertia)
+        _physics_step_fn : override for testing (default: mujoco.mj_step)
+
+        Returns
+        -------
+        GripperCloseResult
+        """
+        step_fn   = _physics_step_fn or (lambda: mujoco.mj_step(
+            self.kin.model, self.kin.data))
+        ctrl_step = target_ctrl / n_ramp_steps
+
+        # Start from open
+        self.kin.data.ctrl[_GRIPPER_ACT_IDX] = 0.0
+        prev_driver = float(self.kin.data.qpos[_RDRIVER_QPOS])
+
+        for i in range(n_ramp_steps):
+            ctrl_val = min((i + 1) * ctrl_step, target_ctrl)
+            self.kin.data.ctrl[_GRIPPER_ACT_IDX] = ctrl_val
+            # Keep arm joints frozen at current pose during close
+            self.kin.data.ctrl[_ARM_ACT_SLICE] = self._q_current
+            step_fn()
+
+            driver_pos = float(self.kin.data.qpos[_RDRIVER_QPOS])
+
+            if i >= min_steps:
+                delta = abs(driver_pos - prev_driver)
+                if delta < resistance_tol:
+                    self._gripper = ctrl_val
+                    return GripperCloseResult(
+                        final_ctrl       = ctrl_val,
+                        steps_taken      = i + 1,
+                        object_detected  = True,
+                        final_driver_pos = driver_pos,
+                    )
+            prev_driver = driver_pos
+
+        self._gripper = target_ctrl
+        return GripperCloseResult(
+            final_ctrl       = target_ctrl,
+            steps_taken      = n_ramp_steps,
+            object_detected  = False,
+            final_driver_pos = float(self.kin.data.qpos[_RDRIVER_QPOS]),
+        )
 
     # ── physics step ──────────────────────────────────────────────────────────
 

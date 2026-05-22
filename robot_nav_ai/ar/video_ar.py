@@ -54,6 +54,7 @@ PLAYBACK = {
     "GRIPPER_CLOSE": 0.0,
     "WAVE"         : 0.0,
     "HOME"         : 0.0,
+    "PICK"         : 0.0,   # video pauses during grasp execution
 }
 
 
@@ -156,6 +157,164 @@ class SLAMWorker:
             time.sleep(0.033)   # ~30 fps SLAM cap
 
 
+# ── grasp session ─────────────────────────────────────────────────────────────
+
+class GraspSession:
+    """
+    Ties together detection → localise → plan → execute for one pick command.
+
+    Called from the main video loop when a PICK command arrives.  The video
+    is already paused (speed=0) before this is invoked.  The session runs
+    the full pipeline in a background thread so the display loop can keep
+    drawing the status overlay.
+
+    Usage
+    -----
+        session = GraspSession(detector, localiser, ar_cfg.intrinsics)
+        session.start("mug")          # non-blocking
+        while session.running:
+            overlay_text = session.status
+        result = session.result
+    """
+
+    # Human-readable labels for each GraspState
+    _STATE_LABELS = {
+        "IDLE"               : "READY",
+        "MOVING_TO_PREGRASP" : "MOVING TO PRE-GRASP...",
+        "MOVING_TO_GRASP"    : "MOVING TO GRASP...",
+        "CLOSING"            : "CLOSING GRIPPER...",
+        "LIFTING"            : "LIFTING...",
+        "DONE"               : "GRASP COMPLETE",
+        "FAILED"             : "GRASP FAILED",
+    }
+
+    def __init__(self, detector, localiser, intrinsics) -> None:
+        self._detector   = detector
+        self._localiser  = localiser
+        self._intrinsics = intrinsics
+        self.status      = "IDLE"
+        self.running     = False
+        self.result      = None
+        self._thread     = None
+
+    def start(self, target_label: str) -> None:
+        """Launch the grasp pipeline in a daemon thread."""
+        self.running = True
+        self.status  = f"SEARCHING FOR '{target_label.upper()}'..."
+        self._thread = threading.Thread(
+            target=self._run, args=(target_label,), daemon=True
+        )
+        self._thread.start()
+
+    def _run(self, target_label: str) -> None:
+        try:
+            self._execute(target_label)
+        except Exception as e:
+            self.status  = f"ERROR: {e}"
+            self.result  = None
+        finally:
+            self.running = False
+
+    def _execute(self, target_label: str) -> None:
+        from ar.grasp_planner   import GraspPlanner
+        from ar.grasp_pose      import ApproachType, GraspApproach
+        from ar.grasp_executor  import GraspExecutor, GraspState
+        from ar.localiser       import Localiser
+        from robot.kinematics   import TidyBotKinematics
+        from robot.robot_controller import RobotController
+
+        # ── find object ──────────────────────────────────────────────────
+        self.status = f"LOCATING '{target_label.upper()}'..."
+        if self._detector is None or self._localiser is None:
+            self.status = "NO DETECTOR/LOCALISER — cannot grasp"
+            return
+
+        dets      = self._detector.latest
+        depth_map = self._localiser.latest_depth()
+        if not dets or depth_map is None:
+            self.status = "NO DETECTIONS — try again when object is visible"
+            return
+
+        xyz_list = self._localiser.localise(dets, depth_map, self._intrinsics)
+
+        # Pick the best match to target_label (highest confidence)
+        target_xyz = None
+        best_conf  = -1.0
+        for det, xyz in zip(dets, xyz_list):
+            if xyz is None:
+                continue
+            label_match = (target_label in det.label.lower() or
+                           det.label.lower() in target_label)
+            if label_match and det.confidence > best_conf:
+                target_xyz = xyz
+                best_conf  = det.confidence
+                break
+
+        if target_xyz is None:
+            # Fall back: use highest-confidence detection regardless of label
+            for det, xyz in zip(dets, xyz_list):
+                if xyz is not None and det.confidence > best_conf:
+                    target_xyz = xyz
+                    best_conf  = det.confidence
+
+        if target_xyz is None:
+            self.status = "OBJECT NOT LOCALISED"
+            return
+
+        obj_xyz = np.array(target_xyz, dtype=float)
+
+        # ── reachability ─────────────────────────────────────────────────
+        self.status = "CHECKING REACH..."
+        try:
+            kin = TidyBotKinematics()
+            kin.check_reachable(obj_xyz)
+        except Exception as e:
+            self.status = f"OUT OF REACH: {e}"
+            return
+
+        # ── plan ─────────────────────────────────────────────────────────
+        self.status = "PLANNING..."
+        approach_vec = np.array([0.0, 0.0, -1.0])   # downward (TOP_DOWN)
+        v            = approach_vec / np.linalg.norm(approach_vec)
+        approach     = GraspApproach(
+            n_hat=v, approach_vec=-v,
+            approach_type=ApproachType.TOP_DOWN, confidence=1.0,
+        )
+        pose = GraspPlanner().plan(obj_xyz, approach)
+
+        # ── execute ───────────────────────────────────────────────────────
+        ctrl     = RobotController(kin)
+        executor = GraspExecutor(ctrl, kin)
+
+        # Intercept state transitions for live overlay
+        original_transition = executor._transition
+        state_labels = self._STATE_LABELS
+
+        def _tracked_transition(new_state) -> None:
+            original_transition(new_state)
+            label = state_labels.get(new_state.name, new_state.name)
+            self.status = label
+
+        executor._transition = _tracked_transition
+
+        self.result = executor.execute(pose)
+        self.status = (
+            "GRASP COMPLETE ✓" if self.result.success
+            else f"FAILED: {self.result.fail_reason}"
+        )
+
+
+def _draw_grasp_status(frame: np.ndarray, status: str) -> None:
+    """Draw grasp status banner at the top of the frame."""
+    H, W = frame.shape[:2]
+    # Dark banner
+    cv2.rectangle(frame, (0, 0), (W, 48), (20, 20, 20), -1)
+    cv2.putText(frame, status, (12, 32),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(frame, status, (12, 32),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 200, 255), 1, cv2.LINE_AA)
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -237,10 +396,11 @@ def main() -> None:
         localiser = None
 
     # ── command interface ─────────────────────────────────────────────────────
-    quit_event   = threading.Event()
-    _cur_speed   = [0.0]   # shared mutable for SLAM worker
+    quit_event    = threading.Event()
+    _cur_speed    = [0.0]   # shared mutable for SLAM worker
+    _grasp_session: list = [None]   # [GraspSession | None]
 
-    def on_command(cmd: Cmd) -> None:
+    def on_command(cmd: Cmd, raw_text: str = "") -> None:
         controller.set_command(cmd)
         speed = PLAYBACK.get(cmd.name, 0.0)
         player.set_speed(speed)
@@ -249,16 +409,15 @@ def main() -> None:
                      else "playing backward" if speed < 0 else "paused")
         print(f"[video_ar] {cmd.name}  →  {direction}")
 
-    def on_pick_command(text: str) -> bool:
-        """Handle 'pick up X' — lock detector onto target object."""
-        t = text.strip().lower()
-        pick_words = ["pick", "grab", "get", "fetch", "bring"]
-        if not any(w in t for w in pick_words):
-            return False
-        if use_detect and detector is not None:
-            detector.set_target(t)
-            print(f"[video_ar] Searching for target: '{t}'")
-        return True
+        if cmd == Cmd.PICK:
+            from ar.command_interface import parse_pick_target
+            target = parse_pick_target(raw_text) if raw_text else "object"
+            print(f"[video_ar] PICK command — target: '{target}'")
+            session = GraspSession(detector if use_detect else None,
+                                   localiser if use_depth else None,
+                                   ar_cfg.intrinsics)
+            _grasp_session[0] = session
+            session.start(target)
 
     cmd_iface = CommandInterface(on_command=on_command, on_quit=quit_event.set)
     renderer.start_physics(controller=controller)
@@ -308,6 +467,13 @@ def main() -> None:
             # SLAM minimap overlay
             if use_slam and slam is not None:
                 slam.draw_minimap(out)
+
+            # Grasp status overlay (takes priority when session is active)
+            session = _grasp_session[0]
+            if session is not None and (session.running or session.status not in ("IDLE", "READY")):
+                _draw_grasp_status(out, session.status)
+                if not session.running:
+                    _grasp_session[0] = None   # clear after done
 
             # Status overlay
             cmd_name = controller.current().name

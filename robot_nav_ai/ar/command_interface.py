@@ -43,24 +43,28 @@ class Cmd(Enum):
     GRIPPER_CLOSE = auto()
     WAVE          = auto()
     HOME          = auto()
+    PICK          = auto()   # "pick up <object>" — triggers full grasp pipeline
     QUIT          = auto()
 
 
 # ── keyword → command map ─────────────────────────────────────────────────────
 
 _KEYWORDS: list[tuple[list[str], Cmd]] = [
-    (["forward", "ahead", "advance", "go"],           Cmd.FORWARD),
-    (["back", "backward", "reverse", "retreat"],      Cmd.BACKWARD),
-    (["left", "rotate left", "spin left"],            Cmd.TURN_LEFT),
-    (["right", "rotate right", "spin right"],         Cmd.TURN_RIGHT),
-    (["stop", "halt", "freeze", "wait", "stand"],     Cmd.STOP),
-    (["arm up", "raise", "lift arm", "reach"],        Cmd.ARM_UP),
-    (["arm down", "lower", "retract"],                Cmd.ARM_DOWN),
-    (["open", "release", "drop"],                     Cmd.GRIPPER_OPEN),
-    (["close", "grab", "grasp", "pick"],              Cmd.GRIPPER_CLOSE),
-    (["wave", "hello", "hi"],                         Cmd.WAVE),
-    (["home", "reset", "origin"],                     Cmd.HOME),
-    (["quit", "exit", "bye", "q"],                    Cmd.QUIT),
+    (["forward", "ahead", "advance", "go"],                      Cmd.FORWARD),
+    (["back", "backward", "reverse", "retreat"],                 Cmd.BACKWARD),
+    (["left", "rotate left", "spin left"],                       Cmd.TURN_LEFT),
+    (["right", "rotate right", "spin right"],                    Cmd.TURN_RIGHT),
+    (["stop", "halt", "freeze", "wait", "stand"],                Cmd.STOP),
+    (["arm up", "raise", "lift arm", "reach"],                   Cmd.ARM_UP),
+    (["arm down", "lower", "retract"],                           Cmd.ARM_DOWN),
+    (["open", "release", "drop"],                                Cmd.GRIPPER_OPEN),
+    # PICK must come before GRIPPER_CLOSE so "pick up X" is not swallowed by "pick"
+    (["pick up", "pick me", "get me", "fetch", "bring me",
+      "grab the", "take the", "get the"],                        Cmd.PICK),
+    (["close", "grab", "grasp", "pick"],                         Cmd.GRIPPER_CLOSE),
+    (["wave", "hello", "hi"],                                    Cmd.WAVE),
+    (["home", "reset", "origin"],                                Cmd.HOME),
+    (["quit", "exit", "bye", "q"],                               Cmd.QUIT),
 ]
 
 
@@ -71,6 +75,32 @@ def parse(text: str) -> Optional[Cmd]:
         if any(kw in t for kw in keywords):
             return cmd
     return None
+
+
+def parse_pick_target(text: str) -> str:
+    """
+    Extract the object name from a PICK command.
+
+    Examples
+    --------
+    "pick up the mug"   → "mug"
+    "get me a cup"      → "cup"
+    "fetch the bottle"  → "bottle"
+    "grab the red mug"  → "red mug"
+    """
+    t = text.strip().lower()
+    # Strip leading trigger phrases
+    triggers = [
+        "pick up the", "pick up a", "pick up",
+        "get me the", "get me a", "get me", "get the",
+        "fetch the", "fetch a", "fetch",
+        "bring me the", "bring me a", "bring me",
+        "grab the", "grab a", "take the", "take a",
+    ]
+    for trigger in sorted(triggers, key=len, reverse=True):
+        if t.startswith(trigger):
+            return t[len(trigger):].strip()
+    return t
 
 
 # ── robot ctrl applier ────────────────────────────────────────────────────────
@@ -240,4 +270,8 @@ class CommandInterface:
                 return
 
             print(f"[cmd] → {cmd.name}")
-            self._on_command(cmd)
+            # Pass raw text so PICK handler can extract object name
+            try:
+                self._on_command(cmd, text)
+            except TypeError:
+                self._on_command(cmd)

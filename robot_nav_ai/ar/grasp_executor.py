@@ -1,5 +1,5 @@
 """
-ar/grasp_executor.py — Grasp execution state machine (Block 5.1).
+ar/grasp_executor.py — Grasp execution state machine (Blocks 5.1 / 5.4).
 
 State machine
 -------------
@@ -71,13 +71,13 @@ import numpy as np
 
 from ar.grasp_planner import GraspPose
 from robot.kinematics  import TidyBotKinematics, ARM_QPOS_SLICE
-from robot.robot_controller import RobotController
+from robot.robot_controller import RobotController, GripperCloseResult
 
 # ── constants ─────────────────────────────────────────────────────────────────
 
-MAX_STEPS_PER_MOVE:  int   = 500    # step budget per move segment
-CLOSE_SETTLE_STEPS:  int   = 20     # steps to hold gripper closed before lift
-LIFT_HEIGHT_M:       float = 0.10   # how high to lift above grasp point
+MAX_STEPS_PER_MOVE:   int   = 500    # step budget per move segment
+LIFT_HEIGHT_M:        float = 0.10   # how high to lift above grasp point
+LIFT_SUCCESS_MIN_Z:   float = 0.05   # minimum Δz to call lift "successful"
 
 
 # ── state enum ────────────────────────────────────────────────────────────────
@@ -95,6 +95,33 @@ class GraspState(Enum):
 # ── result ────────────────────────────────────────────────────────────────────
 
 @dataclass
+class LiftResult:
+    """
+    Result of the LIFTING phase.
+
+    Attributes
+    ----------
+    ee_xyz_pre   : EE position at grasp (before lift)
+    ee_xyz_post  : EE position after lift IK converged
+    delta_z      : vertical rise of EE (metres)
+    success      : True if delta_z > LIFT_SUCCESS_MIN_Z (object likely lifted)
+    ik_converged : True if lift IK solved successfully
+    """
+    ee_xyz_pre:   np.ndarray
+    ee_xyz_post:  np.ndarray
+    delta_z:      float
+    success:      bool
+    ik_converged: bool
+
+    def __str__(self) -> str:
+        status = "LIFTED" if self.success else "NO LIFT"
+        return (
+            f"LiftResult [{status}]  Δz={self.delta_z*100:.1f} cm  "
+            f"ik_ok={self.ik_converged}"
+        )
+
+
+@dataclass
 class ExecutionResult:
     """
     Summary of one GraspExecutor.execute() run.
@@ -106,6 +133,8 @@ class ExecutionResult:
     states_visited   : ordered list of states (for test verification)
     total_steps      : total controller steps consumed
     elapsed_s        : wall-clock time
+    gripper_result   : GripperCloseResult from the CLOSING phase
+    lift_result      : LiftResult from the LIFTING phase (None if skipped)
     fail_reason      : explanation if success is False
     """
     success:        bool
@@ -113,17 +142,24 @@ class ExecutionResult:
     states_visited: List[GraspState]
     total_steps:    int
     elapsed_s:      float
+    gripper_result: Optional[GripperCloseResult] = None
+    lift_result:    Optional[LiftResult]         = None
     fail_reason:    str = ""
 
     def __str__(self) -> str:
         status = "SUCCESS" if self.success else f"FAILED ({self.fail_reason})"
         path   = " → ".join(s.name for s in self.states_visited)
-        return (
-            f"ExecutionResult [{status}]\n"
-            f"  path   : {path}\n"
-            f"  steps  : {self.total_steps}\n"
-            f"  elapsed: {self.elapsed_s*1000:.1f} ms"
-        )
+        lines  = [
+            f"ExecutionResult [{status}]",
+            f"  path   : {path}",
+            f"  steps  : {self.total_steps}",
+            f"  elapsed: {self.elapsed_s*1000:.1f} ms",
+        ]
+        if self.gripper_result:
+            lines.append(f"  gripper: {self.gripper_result}")
+        if self.lift_result:
+            lines.append(f"  lift   : {self.lift_result}")
+        return "\n".join(lines)
 
 
 # ── executor ──────────────────────────────────────────────────────────────────
@@ -209,22 +245,40 @@ class GraspExecutor:
         self._transition(GraspState.CLOSING)
         states_visited.append(self._state)
 
-        self.ctrl.close_gripper()
-        self.ctrl.step(CLOSE_SETTLE_STEPS)   # hold for settle
-        total_steps += CLOSE_SETTLE_STEPS
+        # Ramped close: 0 → 200 over 0.5 s; stops early if object resists
+        gripper_result = self.ctrl.close_gripper_ramped()
+        total_steps   += gripper_result.steps_taken
 
         # ── 4. LIFTING ───────────────────────────────────────────────────────
         self._transition(GraspState.LIFTING)
         states_visited.append(self._state)
 
+        ee_pre   = self.ctrl.get_ee_xyz()
         lift_xyz = np.asarray(pose.grasp_xyz) + np.array([0.0, 0.0, LIFT_HEIGHT_M])
         ik_lift  = self.kin.ik(lift_xyz, q_init=self.ctrl.get_joints())
 
+        lift_result: Optional[LiftResult] = None
         if ik_lift.converged:
             self.ctrl.set_joint_targets(ik_lift.q_arm)
             _, steps = self.ctrl.run_until_converged(self.max_steps)
             total_steps += steps
-        # If lift IK fails we still consider the grasp successful (object secured)
+            ee_post  = self.ctrl.get_ee_xyz()
+            delta_z  = float(ee_post[2] - ee_pre[2])
+            lift_result = LiftResult(
+                ee_xyz_pre   = ee_pre,
+                ee_xyz_post  = ee_post,
+                delta_z      = delta_z,
+                success      = delta_z > LIFT_SUCCESS_MIN_Z,
+                ik_converged = True,
+            )
+        else:
+            lift_result = LiftResult(
+                ee_xyz_pre   = ee_pre,
+                ee_xyz_post  = ee_pre,
+                delta_z      = 0.0,
+                success      = False,
+                ik_converged = False,
+            )
 
         # ── 5. DONE ──────────────────────────────────────────────────────────
         self._transition(GraspState.DONE)
@@ -236,6 +290,8 @@ class GraspExecutor:
             states_visited = states_visited,
             total_steps    = total_steps,
             elapsed_s      = time.perf_counter() - t0,
+            gripper_result = gripper_result,
+            lift_result    = lift_result,
         )
 
     # ── helpers ───────────────────────────────────────────────────────────────
@@ -258,6 +314,8 @@ class GraspExecutor:
             states_visited = states_visited,
             total_steps    = total_steps,
             elapsed_s      = time.perf_counter() - t0,
+            gripper_result = None,
+            lift_result    = None,
             fail_reason    = reason,
         )
 
