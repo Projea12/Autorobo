@@ -323,6 +323,64 @@ def _draw_grasp_status(frame: np.ndarray, status: str) -> None:
                 cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 200, 255), 1, cv2.LINE_AA)
 
 
+def _draw_trajectory_arc(
+    frame: np.ndarray,
+    robot_px: tuple,
+    pre_px:   tuple,
+    grs_px:   tuple,
+    phase:    float,
+) -> None:
+    """
+    Draw an animated trajectory arc on the frame in-place.
+
+    Two segments:  robot_sprite → pre_grasp  (yellow dots)
+                   pre_grasp   → grasp        (orange dots + arrow)
+
+    phase ∈ [0, 1) drives the dot animation (use time.time() % 1.0).
+    """
+    H, W = frame.shape[:2]
+
+    def _ok(p):
+        return p is not None and 0 <= p[0] < W and 0 <= p[1] < H
+
+    segments = []
+    if _ok(robot_px) and _ok(pre_px):
+        segments.append((robot_px, pre_px, (0, 220, 220)))   # cyan — approach
+    if _ok(pre_px) and _ok(grs_px):
+        segments.append((pre_px, grs_px, (0, 165, 255)))     # orange — descent
+
+    N_DOTS = 18
+    for p1, p2, col in segments:
+        # Static dim guide line
+        cv2.line(frame, p1, p2, (50, 50, 50), 2, cv2.LINE_AA)
+        # Animated travelling dots
+        for i in range(N_DOTS):
+            t = (i / N_DOTS + phase) % 1.0
+            px = int(p1[0] + t * (p2[0] - p1[0]))
+            py = int(p1[1] + t * (p2[1] - p1[1]))
+            if 0 <= px < W and 0 <= py < H:
+                cv2.circle(frame, (px, py), 3, col, -1, cv2.LINE_AA)
+
+    # Key-point markers
+    if _ok(pre_px):
+        cv2.circle(frame, pre_px, 9,  (0, 220, 220), 2, cv2.LINE_AA)
+        cv2.circle(frame, pre_px, 3,  (0, 220, 220), -1, cv2.LINE_AA)
+        cv2.putText(frame, "PRE", (pre_px[0] + 11, pre_px[1] + 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 220, 220), 1, cv2.LINE_AA)
+
+    if _ok(grs_px):
+        cv2.circle(frame, grs_px, 9,  (0, 165, 255), 2, cv2.LINE_AA)
+        cv2.circle(frame, grs_px, 3,  (0, 165, 255), -1, cv2.LINE_AA)
+        cv2.putText(frame, "GRASP", (grs_px[0] + 11, grs_px[1] + 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 165, 255), 1, cv2.LINE_AA)
+        # Approach arrow pre → grasp
+        if _ok(pre_px):
+            cv2.arrowedLine(frame, pre_px, grs_px,
+                            (255, 255, 255), 3, cv2.LINE_AA, tipLength=0.30)
+            cv2.arrowedLine(frame, pre_px, grs_px,
+                            (0, 165, 255), 2, cv2.LINE_AA, tipLength=0.30)
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -348,6 +406,7 @@ def main() -> None:
     from ar.object_detector   import ObjectDetector
     from ar.localiser         import Localiser
     from robot.kinematics     import TidyBotKinematics
+    from ar.transforms        import project_to_pixel
 
     # ── open video ────────────────────────────────────────────────────────────
     player = VideoPlayer(str(video_path))
@@ -611,6 +670,15 @@ def main() -> None:
                     target=_launch_plan, args=(_xb,), daemon=True
                 )
                 _plan_thread[0].start()
+
+            # Trajectory arc overlay — shown whenever a plan is ready
+            plan = _click_plan[0]
+            if plan is not None:
+                phase   = time.time() % 1.0
+                pre_px  = project_to_pixel(plan.pre_grasp_xyz, ar_cfg.intrinsics)
+                grs_px  = project_to_pixel(plan.grasp_xyz,     ar_cfg.intrinsics)
+                robot_px = (u, v)   # sprite screen position
+                _draw_trajectory_arc(out, robot_px, pre_px, grs_px, phase)
 
             # Draw click-to-grasp crosshair + 3D label + reachability colour
             click = _click_state[0]
