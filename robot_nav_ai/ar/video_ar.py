@@ -722,26 +722,49 @@ def main() -> None:
 
             # Pixel → 3D unproject for clicked point
             click = _click_state[0]
-            if click is not None and use_depth and localiser is not None:
-                depth_map = localiser.latest_depth()
-                if depth_map is not None:
-                    cu, cv_ = click
-                    dh_dm, dw_dm = depth_map.shape[:2]
-                    # Clamp to depth map dimensions (may differ from frame)
-                    su = int(cu * dw_dm / W)
-                    sv = int(cv_ * dh_dm / H)
-                    su = max(0, min(dw_dm - 1, su))
-                    sv = max(0, min(dh_dm - 1, sv))
-                    d  = float(depth_map[sv, su])
-                    if d > 0.05:   # ignore zero / near-zero depth
-                        xyz_cam  = Localiser.back_project(cu, cv_, d, ar_cfg.intrinsics)
-                        xyz_base = Localiser.to_base_frame(xyz_cam)
-                        _click_xyz[0] = xyz_base
-                        # Reachability check — pure distance, O(1)
-                        _click_reachable[0] = _kin.is_reachable(xyz_base)
-                    else:
-                        _click_xyz[0]       = None
-                        _click_reachable[0] = None
+            if click is not None:
+                cu, cv_ = click
+                xyz_base = None
+
+                # Primary: per-pixel depth from DepthAnything
+                if use_depth and localiser is not None:
+                    depth_map = localiser.latest_depth()
+                    if depth_map is not None:
+                        dh_dm, dw_dm = depth_map.shape[:2]
+                        su = int(cu * dw_dm / W)
+                        sv = int(cv_ * dh_dm / H)
+                        su = max(0, min(dw_dm - 1, su))
+                        sv = max(0, min(dh_dm - 1, sv))
+                        d  = float(depth_map[sv, su])
+                        if d > 0.05:
+                            xyz_cam  = Localiser.back_project(cu, cv_, d, ar_cfg.intrinsics)
+                            xyz_base = Localiser.to_base_frame(xyz_cam)
+
+                # Fallback: snap to nearest YOLO detection with known 3D position
+                if xyz_base is None and use_detect and detector is not None:
+                    dets = detector.latest
+                    if dets and use_depth and localiser is not None:
+                        depth_map = localiser.latest_depth()
+                        if depth_map is not None:
+                            xyz_list = localiser.localise(dets, depth_map, ar_cfg.intrinsics)
+                            best_dist, best_xyz = float("inf"), None
+                            for det, xyz in zip(dets, xyz_list):
+                                if xyz is None:
+                                    continue
+                                uc, vc = det.centroid_uv
+                                d2 = (cu - uc) ** 2 + (cv_ - vc) ** 2
+                                if d2 < best_dist:
+                                    best_dist, best_xyz = d2, xyz
+                            if best_xyz is not None and best_dist < (150 ** 2):
+                                xyz_base = best_xyz
+                                print(f"[click] snapped to nearest detection  xyz={tuple(round(x,3) for x in xyz_base)}")
+
+                if xyz_base is not None:
+                    _click_xyz[0]       = xyz_base
+                    _click_reachable[0] = _kin.is_reachable(xyz_base)
+                else:
+                    _click_xyz[0]       = None
+                    _click_reachable[0] = None
 
             # Trigger IK + plan when click lands on a new reachable point
             _c  = _click_state[0]
