@@ -347,6 +347,7 @@ def main() -> None:
     from ar.slam              import VisualSLAM, SLAMConfig
     from ar.object_detector   import ObjectDetector
     from ar.localiser         import Localiser
+    from robot.kinematics     import TidyBotKinematics
 
     # ── open video ────────────────────────────────────────────────────────────
     player = VideoPlayer(str(video_path))
@@ -435,13 +436,20 @@ def main() -> None:
     u, v, sprite_h = robot_screen_pos(W, H)
 
     # ── click-to-grasp state ──────────────────────────────────────────────────
-    # _click_state[0] = (u_frame, v_frame) in original frame coords, or None.
-    # _click_xyz[0]   = (X, Y, Z) in robot base frame, or None.
-    # _display_dims[0] = (disp_w, disp_h) — updated each frame so the callback
-    # can scale display-space clicks back to frame space correctly.
-    _click_state:   list = [None]   # [(u, v)] | [None]
-    _click_xyz:     list = [None]   # [(X, Y, Z) base frame] | [None]
-    _display_dims:  list = [(W, H)]
+    # _click_state[0]     = (u_frame, v_frame) in original frame coords, or None.
+    # _click_xyz[0]       = (X, Y, Z) in robot base frame, or None.
+    # _click_reachable[0] = True | False | None (None = no xyz yet)
+    # _display_dims[0]    = (disp_w, disp_h) — updated each frame so the callback
+    #                       can scale display-space clicks back to frame space.
+    _click_state:     list = [None]   # [(u, v)] | [None]
+    _click_xyz:       list = [None]   # [(X, Y, Z) base frame] | [None]
+    _click_reachable: list = [None]   # [True | False | None]
+    _display_dims:    list = [(W, H)]
+
+    # Shared kinematics instance for the click pipeline (reachability + IK)
+    print("[video_ar] Loading kinematics for click-to-grasp pipeline...")
+    _kin = TidyBotKinematics()
+    print("[video_ar] Kinematics ready.")
 
     WIN = "Autorobo — TidyBot Navigation (Q to quit)"
     cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
@@ -545,28 +553,48 @@ def main() -> None:
                         xyz_cam  = Localiser.back_project(cu, cv_, d, ar_cfg.intrinsics)
                         xyz_base = Localiser.to_base_frame(xyz_cam)
                         _click_xyz[0] = xyz_base
+                        # Reachability check — pure distance, O(1)
+                        _click_reachable[0] = _kin.is_reachable(xyz_base)
                     else:
-                        _click_xyz[0] = None
+                        _click_xyz[0]       = None
+                        _click_reachable[0] = None
 
-            # Draw click-to-grasp crosshair + 3D label
+            # Draw click-to-grasp crosshair + 3D label + reachability colour
             click = _click_state[0]
             if click is not None:
                 cu, cv_ = click
-                r    = 18
-                xyz  = _click_xyz[0]
-                col  = (0, 255, 255)   # cyan until reachability known
+                r         = 18
+                xyz       = _click_xyz[0]
+                reachable = _click_reachable[0]
+
+                # Colour: green = reachable, red = out of reach, cyan = no depth
+                if reachable is True:
+                    col      = (0, 220, 0)
+                    reach_lbl = "REACHABLE"
+                elif reachable is False:
+                    col      = (0, 0, 220)
+                    reach_lbl = "OUT OF REACH"
+                else:
+                    col      = (0, 255, 255)
+                    reach_lbl = "NO DEPTH"
+
                 cv2.circle(out, (cu, cv_), r, col, 2, cv2.LINE_AA)
                 cv2.line(out, (cu - r, cv_), (cu + r, cv_), col, 1, cv2.LINE_AA)
                 cv2.line(out, (cu, cv_ - r), (cu, cv_ + r), col, 1, cv2.LINE_AA)
+
+                # XYZ label above crosshair
                 if xyz is not None:
-                    label3d = (f"({xyz[0]:+.2f}, {xyz[1]:+.2f}, {xyz[2]:.2f}) m")
-                    cv2.putText(out, label3d, (cu + r + 4, cv_ - 6),
+                    label3d = f"({xyz[0]:+.2f}, {xyz[1]:+.2f}, {xyz[2]:.2f}) m"
+                    cv2.putText(out, label3d, (cu + r + 4, cv_ - 18),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 0, 0), 3, cv2.LINE_AA)
-                    cv2.putText(out, label3d, (cu + r + 4, cv_ - 6),
+                    cv2.putText(out, label3d, (cu + r + 4, cv_ - 18),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.46, col, 1, cv2.LINE_AA)
-                else:
-                    cv2.putText(out, "NO DEPTH", (cu + r + 4, cv_ - 6),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 100, 255), 1, cv2.LINE_AA)
+
+                # Reachability label below XYZ
+                cv2.putText(out, reach_lbl, (cu + r + 4, cv_ - 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 0, 0), 3, cv2.LINE_AA)
+                cv2.putText(out, reach_lbl, (cu + r + 4, cv_ - 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.50, col, 1, cv2.LINE_AA)
 
             # Scale up for display
             disp_h  = 720
