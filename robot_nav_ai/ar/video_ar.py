@@ -192,10 +192,11 @@ class GraspSession:
         self._detector   = detector
         self._localiser  = localiser
         self._intrinsics = intrinsics
-        self.status      = "IDLE"
-        self.running     = False
-        self.result      = None
-        self._thread     = None
+        self.status       = "IDLE"
+        self.running      = False
+        self.result       = None
+        self.grasp_result = None   # GraspResult for Phase 8
+        self._thread      = None
 
     def start(self, target_label: str) -> None:
         """Launch the grasp pipeline in a daemon thread."""
@@ -297,10 +298,17 @@ class GraspSession:
 
         executor._transition = _tracked_transition
 
-        self.result = executor.execute(pose)
+        exec_result = executor.execute(pose)
+        self.result = exec_result
+
+        # Block 6.3/6.4 — report outcome and produce Phase-8 GraspResult
+        from ar.grasp_reporter import GraspReporter
+        reporter      = GraspReporter()
+        self.grasp_result = reporter.report(exec_result, label=target_label)
+
         self.status = (
-            "GRASP COMPLETE ✓" if self.result.success
-            else f"FAILED: {self.result.fail_reason}"
+            "GRASP COMPLETE ✓" if exec_result.success
+            else f"FAILED: {exec_result.fail_reason}"
         )
 
 
