@@ -451,6 +451,41 @@ def main() -> None:
     _kin = TidyBotKinematics()
     print("[video_ar] Kinematics ready.")
 
+    # Plan state — populated by background thread after each new reachable click
+    _click_plan:         list = [None]   # GraspPose | None
+    _click_plan_status:  list = [""]     # "" | "PLANNING..." | "PLAN READY" | "PLAN FAILED: ..."
+    _last_planned_click: list = [None]   # (u,v) of last triggered plan
+    _plan_thread:        list = [None]   # threading.Thread | None
+
+    def _launch_plan(xyz_base: tuple) -> None:
+        """Run IK + GraspPlanner in a daemon thread for the clicked point."""
+        from ar.grasp_planner import GraspPlanner
+        from ar.grasp_pose    import GraspApproach, ApproachType
+
+        _click_plan_status[0] = "PLANNING..."
+        _click_plan[0]        = None
+        try:
+            approach_vec = np.array([0.0, 0.0, -1.0])   # TOP_DOWN
+            v            = approach_vec / np.linalg.norm(approach_vec)
+            approach     = GraspApproach(
+                n_hat=v, approach_vec=-v,
+                approach_type=ApproachType.TOP_DOWN, confidence=1.0,
+            )
+            pose = GraspPlanner().plan(np.asarray(xyz_base, dtype=float), approach)
+            # Verify IK is solvable for both waypoints
+            ik_pre = _kin.ik(pose.pre_grasp_xyz)
+            ik_grs = _kin.ik(pose.grasp_xyz)
+            if not ik_pre.converged or not ik_grs.converged:
+                _click_plan_status[0] = "PLAN FAILED: IK did not converge"
+                return
+            _click_plan[0]       = pose
+            _click_plan_status[0] = "PLAN READY — click again to execute"
+            print(f"[click] Plan ready  pre_grasp={np.round(pose.pre_grasp_xyz,3)}  "
+                  f"grasp={np.round(pose.grasp_xyz,3)}")
+        except Exception as exc:
+            _click_plan_status[0] = f"PLAN FAILED: {exc}"
+            print(f"[click] Plan failed: {exc}")
+
     WIN = "Autorobo — TidyBot Navigation (Q to quit)"
     cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
 
@@ -466,7 +501,12 @@ def main() -> None:
             _click_state[0] = (fx, fy)
             print(f"[click] pixel ({fx}, {fy})  →  queued for grasp")
         elif event == cv2.EVENT_RBUTTONDOWN:
-            _click_state[0] = None
+            _click_state[0]       = None
+            _click_xyz[0]         = None
+            _click_reachable[0]   = None
+            _click_plan[0]        = None
+            _click_plan_status[0] = ""
+            _last_planned_click[0]= None
             print("[click] cleared")
 
     cv2.setMouseCallback(WIN, _on_mouse)
@@ -559,6 +599,19 @@ def main() -> None:
                         _click_xyz[0]       = None
                         _click_reachable[0] = None
 
+            # Trigger IK + plan when click lands on a new reachable point
+            _c  = _click_state[0]
+            _xb = _click_xyz[0]
+            if (_c is not None and _xb is not None and
+                    _click_reachable[0] is True and
+                    _c != _last_planned_click[0] and
+                    (_plan_thread[0] is None or not _plan_thread[0].is_alive())):
+                _last_planned_click[0] = _c
+                _plan_thread[0] = threading.Thread(
+                    target=_launch_plan, args=(_xb,), daemon=True
+                )
+                _plan_thread[0].start()
+
             # Draw click-to-grasp crosshair + 3D label + reachability colour
             click = _click_state[0]
             if click is not None:
@@ -595,6 +648,15 @@ def main() -> None:
                             cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 0, 0), 3, cv2.LINE_AA)
                 cv2.putText(out, reach_lbl, (cu + r + 4, cv_ - 2),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.50, col, 1, cv2.LINE_AA)
+
+                # Plan status below reachability
+                plan_lbl = _click_plan_status[0]
+                if plan_lbl:
+                    p_col = (0, 220, 0) if "READY" in plan_lbl else (0, 180, 255)
+                    cv2.putText(out, plan_lbl, (cu + r + 4, cv_ + 16),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 0, 0), 3, cv2.LINE_AA)
+                    cv2.putText(out, plan_lbl, (cu + r + 4, cv_ + 16),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.44, p_col, 1, cv2.LINE_AA)
 
             # Scale up for display
             disp_h  = 720
