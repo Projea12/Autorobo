@@ -33,24 +33,13 @@ ROOT = Path(__file__).resolve().parent.parent
 # Used when running YOLO-World (open vocabulary).
 # Add anything you want the robot to be able to see and pick up.
 HOME_CLASSES = [
-    # Furniture
-    "chair", "couch", "sofa", "bed", "table", "desk", "shelf", "wardrobe",
-    "cabinet", "drawer", "door", "window", "mirror", "curtain", "pillow",
-    # Containers / storage
-    "box", "basket", "bag", "backpack", "suitcase", "bin", "bucket",
-    # Kitchen
-    "cup", "mug", "bottle", "bowl", "plate", "glass", "fork", "knife",
-    "spoon", "kettle", "thermos", "can",
-    # Electronics
-    "phone", "laptop", "remote", "keyboard", "mouse", "charger", "cable",
-    "tv", "speaker", "headphones", "tablet", "camera",
-    # Everyday objects
-    "book", "pen", "pencil", "scissors", "tape", "keys", "wallet",
-    "glasses", "watch", "shoe", "clothing", "towel", "umbrella",
-    # Food / plants
-    "apple", "banana", "orange", "bottle", "potted plant",
-    # Cleaning
-    "broom", "mop", "dustpan", "spray bottle",
+    # Graspable tabletop objects (primary targets)
+    "cup", "mug", "bottle", "bowl", "can", "glass",
+    "book", "remote", "phone", "keys",
+    # Furniture / surfaces (navigation landmarks)
+    "chair", "table", "couch", "shelf",
+    # Plants / food
+    "potted plant", "apple", "banana",
 ]
 
 
@@ -283,7 +272,7 @@ class ObjectDetector:
 
     def __init__(
         self,
-        weights:     str        = "yolov8s-world.pt",
+        weights:     str        = "yolov8l-worldv2.pt",
         every_n:     int        = 3,
         conf_thresh: float      = 0.20,
         device:      str        = "mps",
@@ -619,8 +608,8 @@ def main() -> None:
     parser.add_argument("--video", required=True)
     parser.add_argument("--conf",    type=float, default=0.20)
     parser.add_argument("--every-n", type=int,   default=3)
-    parser.add_argument("--weights",  type=str,  default="yolov8s-world.pt",
-                        help="Model weights: yolov8n.pt (fast) or yolov8s-world.pt (anything)")
+    parser.add_argument("--weights",  type=str,  default="yolov8l-worldv2.pt",
+                        help="Model weights: yolov8l-worldv2.pt (default) or yolov8n.pt (fast)")
     args = parser.parse_args()
 
     video_path = ROOT / args.video if not Path(args.video).is_absolute() \

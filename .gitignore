@@ -1,0 +1,25 @@
+# Model weights
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+venv/
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# MuJoCo logs
+MUJOCO_LOG.TXT
+
+# Misc
+.DS_Store
+*.log
