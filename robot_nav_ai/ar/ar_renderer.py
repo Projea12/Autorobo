@@ -99,8 +99,14 @@ class ARRenderer:
             mujoco.mj_resetDataKeyframe(self._model, self._data, key_id)
         mujoco.mj_forward(self._model, self._data)
 
+        # MuJoCo's default offscreen framebuffer is 1280×720.
+        # Cap the sprite renderer to that limit; the sprite is scaled when
+        # blitted onto the (potentially larger) video frame anyway.
+        _MAX_FB = 1280
+        self._render_w = min(cfg.render_width,  _MAX_FB)
+        self._render_h = min(cfg.render_height, int(_MAX_FB * cfg.render_height / max(cfg.render_width, 1)))
         self._renderer = mujoco.Renderer(
-            self._model, cfg.render_height, cfg.render_width
+            self._model, self._render_h, self._render_w
         )
 
         # Virtual camera for sprite rendering
@@ -109,6 +115,8 @@ class ARRenderer:
         self._sprite_cam.distance   = cfg.sprite_distance
         self._sprite_cam.azimuth    = cfg.sprite_azimuth
         self._sprite_cam.elevation  = cfg.sprite_elevation
+
+
 
         # Hide ground plane, floor geom, and static scene elements
         self._opt = mujoco.MjvOption()
@@ -129,6 +137,19 @@ class ARRenderer:
         self._physics_lock   = threading.Lock()
         self._physics_stop   = threading.Event()
         self._physics_thread: Optional[threading.Thread] = None
+
+        # Cached renderer for the split-screen simulation panel
+        _pw, _ph = 640, 480
+        self._panel_renderer = mujoco.Renderer(self._model, _ph, _pw)
+        self._panel_cam = mujoco.MjvCamera()
+        self._panel_cam.lookat[:] = [0.0, 0.4, 0.45]
+        self._panel_cam.distance  = 1.8
+        self._panel_cam.azimuth   = 45.0
+        self._panel_cam.elevation = -28.0
+
+        # Real object crop from webcam — composited into sim panel at target pos
+        self._target_crop: Optional[np.ndarray] = None
+        self._target_xyz:  Optional[tuple]       = None
 
         print("[ARRenderer] Ready.")
 
@@ -219,9 +240,111 @@ class ARRenderer:
         self._blit(out, rgb, mask, u - rgb.shape[1] // 2, v - rgb.shape[0])
         return out
 
+    def set_target_object_pos(self, xyz_base: tuple) -> None:
+        """Move the target object body to xyz_base and store for crop projection."""
+        mj = self._mj
+        self._target_xyz = xyz_base
+        body_id = mj.mj_name2id(self._model, mj.mjtObj.mjOBJ_BODY, "target_object")
+        if body_id < 0:
+            return
+        with self._physics_lock:
+            self._model.body_pos[body_id] = [xyz_base[0], xyz_base[1], xyz_base[2]]
+            mj.mj_fwdPosition(self._model, self._data)
+            self._sprite_dirty = True
+
+    def set_target_crop(self, crop_bgr: Optional[np.ndarray]) -> None:
+        """Store webcam crop of the clicked object for overlay in sim panel."""
+        self._target_crop = crop_bgr.copy() if crop_bgr is not None else None
+
+    def _project_to_panel(
+        self, xyz_world: tuple, panel_w: int, panel_h: int
+    ) -> Optional[Tuple[int, int]]:
+        """Project a 3D world point into sim panel pixel coordinates."""
+        try:
+            cam   = self._panel_renderer.scene.camera[0]
+            pos   = np.array(cam.pos,     dtype=float)
+            fwd   = np.array(cam.forward, dtype=float)
+            up    = np.array(cam.up,      dtype=float)
+            right = np.cross(fwd, up)
+            p     = np.array(xyz_world,   dtype=float) - pos
+            z     = float(np.dot(p, fwd))
+            if z <= 0.01:
+                return None
+            x      = float(np.dot(p, right))
+            y      = float(np.dot(p, up))
+            near   = float(cam.frustum_near)
+            half_w = float(cam.frustum_width) / 2.0
+            half_h = half_w * panel_h / panel_w
+            u = int(((x / z) * near / half_w  + 1.0) / 2.0 * panel_w)
+            v = int((1.0 - (y / z) * near / half_h) / 2.0 * panel_h)
+            return u, v
+        except Exception:
+            return None
+
+    def mirror_arm_state(self, q7: np.ndarray, gripper_ctrl: float) -> None:
+        """
+        Write arm joint angles and gripper state directly into the renderer's
+        MjData so the simulation panel reflects the executor's live motion.
+        Thread-safe via _physics_lock.
+        """
+        with self._physics_lock:
+            self._data.qpos[3:10] = q7
+            self._data.ctrl[3:10] = q7
+            self._data.ctrl[10]   = gripper_ctrl
+            self._mj.mj_fwdPosition(self._model, self._data)
+            self._sprite_dirty = True
+
+    def render_sim_panel(self, width: int, height: int) -> np.ndarray:
+        """
+        Render a full 3D showcase view of the robot for the split-screen panel.
+        Composites the real webcam object crop at the projected target position.
+        Returns a BGR frame of shape (height, width, 3).
+        """
+        opt = self._mj.MjvOption()
+        with self._physics_lock:
+            self._panel_renderer.update_scene(
+                self._data, camera=self._panel_cam, scene_option=opt
+            )
+        rgb = self._panel_renderer.render().copy()
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        bgr = cv2.convertScaleAbs(bgr, alpha=1.4, beta=15)
+        if bgr.shape[1] != width or bgr.shape[0] != height:
+            bgr = cv2.resize(bgr, (width, height))
+
+        # Composite the real object photo at its projected 3D position
+        crop = self._target_crop
+        xyz  = self._target_xyz
+        if crop is not None and xyz is not None:
+            uv = self._project_to_panel(xyz, width, height)
+            if uv is not None:
+                u, v = uv
+                # Scale crop so it's ~12% of panel height
+                crop_h = max(40, int(height * 0.12))
+                crop_w = int(crop.shape[1] * crop_h / crop.shape[0])
+                thumb  = cv2.resize(crop, (crop_w, crop_h))
+
+                # Draw a white border around the crop
+                bx0 = max(0, u - crop_w // 2 - 2)
+                by0 = max(0, v - crop_h // 2 - 2)
+                bx1 = min(width,  bx0 + crop_w + 4)
+                by1 = min(height, by0 + crop_h + 4)
+                cv2.rectangle(bgr, (bx0, by0), (bx1, by1), (255, 255, 255), 2)
+
+                # Paste crop
+                x0 = max(0, u - crop_w // 2)
+                y0 = max(0, v - crop_h // 2)
+                x1 = min(width,  x0 + crop_w)
+                y1 = min(height, y0 + crop_h)
+                sx0 = x0 - (u - crop_w // 2)
+                sy0 = y0 - (v - crop_h // 2)
+                bgr[y0:y1, x0:x1] = thumb[sy0:sy0+(y1-y0), sx0:sx0+(x1-x0)]
+
+        return bgr
+
     def close(self) -> None:
         self.stop_physics()
         self._renderer.close()
+        self._panel_renderer.close()
 
     # ── internals ─────────────────────────────────────────────────────────────
 
@@ -232,7 +355,7 @@ class ARRenderer:
         This gives true foreshortening: steep angles squash the robot correctly.
         """
         K    = self.cfg.intrinsics
-        h, w = self.cfg.render_height, self.cfg.render_width
+        h, w = self._render_h, self._render_w
         near, far = 0.05, 50.0
         cam  = self._renderer.scene.camera[0]
         cam.frustum_near   = near
