@@ -190,6 +190,12 @@ class RobotController:
             self._base_y  = 0.0
             self._base_th = 0.0
 
+        # Clamp base to a safe range — prevents the position servo from
+        # building up unbounded targets that destabilise MuJoCo dynamics.
+        _MAX = 3.0
+        self._base_x  = float(np.clip(self._base_x,  -_MAX, _MAX))
+        self._base_y  = float(np.clip(self._base_y,  -_MAX, _MAX))
+
         ctrl[0] = self._base_x
         ctrl[1] = self._base_y
         ctrl[2] = self._base_th

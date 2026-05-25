@@ -177,6 +177,9 @@ class ARRenderer:
         model = self._model
         dt    = 1.0 / fps
 
+        # Cache keyframe id so recovery doesn't need a name lookup each step
+        _key_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_KEY, self.cfg.keyframe)
+
         while not self._physics_stop.is_set():
             t0 = time.perf_counter()
 
@@ -186,6 +189,14 @@ class ARRenderer:
                         self._data.ctrl, float(self._data.time)
                     )
                 mj.mj_step(model, self._data)
+
+                # Recover from NaN/Inf instability without crashing
+                if not np.all(np.isfinite(self._data.qacc)):
+                    if _key_id >= 0:
+                        mj.mj_resetDataKeyframe(model, self._data, _key_id)
+                    else:
+                        mj.mj_resetData(model, self._data)
+                    mj.mj_forward(model, self._data)
 
             self._sprite_dirty = True
 

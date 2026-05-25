@@ -404,6 +404,7 @@ def main(interface=None) -> None:
     quit_event    = threading.Event()
     _cur_speed    = [0.0]   # scalar playback speed for SLAM worker
     _grasp_session: list = [None]
+    _move_timer:  list = [None]   # auto-stop timer handle
 
     # Maps each Cmd to a 9-dim normalised action vector.
     # Wheel avg → VideoInterface playback speed (matches original PLAYBACK dict).
@@ -424,12 +425,32 @@ def main(interface=None) -> None:
         Cmd.PICK         : _Z.copy(),
     }
 
+    _MOVE_CMDS = {Cmd.FORWARD, Cmd.BACKWARD, Cmd.TURN_LEFT, Cmd.TURN_RIGHT}
+    _MOVE_DURATION = 0.8   # seconds before auto-stop
+
     def on_command(cmd: Cmd, raw_text: str = "") -> None:
+        # Cancel any pending auto-stop from the previous movement command
+        if _move_timer[0] is not None:
+            _move_timer[0].cancel()
+            _move_timer[0] = None
+
         cmd_controller.set_command(cmd)
         action = _CMD_ACTIONS.get(cmd, _Z)
         interface.apply_action(action)
         # Track playback speed for SLAM worker (zero = don't process SLAM)
         _cur_speed[0] = float((action[0] + action[1]) / 2.0 * 2.0)  # frames/tick
+
+        # Movement commands auto-stop after _MOVE_DURATION seconds so the
+        # robot doesn't drive forever waiting for an explicit "stop".
+        if cmd in _MOVE_CMDS:
+            def _auto_stop():
+                interface.apply_action(_Z)
+                _cur_speed[0] = 0.0
+                cmd_controller.set_command(Cmd.STOP)
+            t = threading.Timer(_MOVE_DURATION, _auto_stop)
+            t.daemon = True
+            t.start()
+            _move_timer[0] = t
 
         if cmd == Cmd.PICK:
             from ar.command_interface import parse_pick_target
