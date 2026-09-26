@@ -1,228 +1,184 @@
 """
-perception/sam_segmentor.py — SAM-based object segmentation for grasp region estimation.
+perception/sam_segmentor.py — SAM 2 segmentor (Meta, 2024).
 
-Wraps Meta's Segment Anything Model (SAM) with bbox-prompted segmentation.
-Given detections from ObjectDetector, produces precise per-object masks that
-DepthProjector can use for robust 3-D position estimates.
+Two modes:
+  prompted  — given a bounding box from YOLOv8, segments that specific object
+  automatic — no prompt, segments every object in the frame (for unknown objects)
 
-Degrades gracefully if segment_anything is not installed: construction
-succeeds in stub mode, inference raises ImportError with a clear message.
+Runs on MPS (Apple M1). Falls back to CPU if MPS unavailable.
 
-Install
-───────
-    pip install git+https://github.com/facebookresearch/segment-anything.git
-    # Download checkpoint (choose one):
-    #   vit_b  ~375 MB  sam_vit_b_01ec64.pth   (fastest, lowest quality)
-    #   vit_l  ~1.2 GB  sam_vit_l_0b3195.pth
-    #   vit_h  ~2.4 GB  sam_vit_h_4b8939.pth   (slowest, best quality)
+Failure modes handled:
+  - Checkpoint missing       → RuntimeError with download instructions
+  - MPS unavailable          → CPU fallback, logged
+  - Inference failure        → returns None / empty list, never crashes pipeline
+  - Empty image              → ValueError
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
-
-from perception.detector import Detection
+import torch
 
 log = logging.getLogger(__name__)
 
-try:
-    import segment_anything as _sam_lib   # type: ignore
-except ImportError:
-    _sam_lib = None  # type: ignore
+_CHECKPOINT   = os.path.join(
+    os.path.dirname(__file__), "..", "..", "checkpoints", "sam2", "sam2_hiera_tiny.pt"
+)
+_CONFIG       = "configs/sam2/sam2_hiera_t.yaml"
+_SCORE_THRESH = 0.5
 
-
-# ── config ────────────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
-class SAMConfig:
-    """
-    Configuration for SAMSegmentor.
-
-    model_type    : SAM architecture — "vit_b", "vit_l", or "vit_h"
-    weights_path  : path to the downloaded SAM checkpoint (.pth file)
-    device        : "cpu", "cuda", "cuda:0", "mps", or "" (auto-detect)
-    score_thresh  : minimum mask quality score to accept in [0, 1];
-                    below this threshold segment_from_bbox returns None
-                    and segment_detections leaves detection.mask unchanged.
-    """
-    model_type:   str   = "vit_b"
-    weights_path: str   = "sam_vit_b.pth"
+class SAM2Config:
+    checkpoint:   str   = _CHECKPOINT
+    config:       str   = _CONFIG
+    score_thresh: float = _SCORE_THRESH
     device:       str   = ""
-    score_thresh: float = 0.5
 
 
-# ── segmentor ─────────────────────────────────────────────────────────────────
-
-class SAMSegmentor:
+class SAM2Segmentor:
     """
-    Bbox-prompted SAM segmentor for YCB manipulation objects.
+    SAM 2 segmentor — prompted and automatic modes.
 
-    Given an RGB image and bbox prompts (from ObjectDetector), returns precise
-    per-object segmentation masks.  Masks can then be passed to DepthProjector
-    for more accurate 3-D position estimation than bbox-median alone.
-
-    Parameters
-    ----------
-    cfg : SAMConfig
-
-    Notes
-    -----
-    • Construction succeeds even if segment_anything is not installed
-      (stub mode — segment_from_bbox / segment_detections raise ImportError).
-    • If the weights file does not exist, construction succeeds but is_loaded
-      will be False and inference will raise RuntimeError.
-    • segment_detections encodes the image once and re-uses the embedding for
-      all per-detection predict() calls (2–10× faster than encoding per bbox).
+    Prompted mode:  given bbox from YOLOv8, returns precise object mask.
+    Automatic mode: no bbox needed, segments everything in the frame.
+                    Used for unknown objects YOLOv8 could not classify.
     """
 
-    def __init__(self, cfg: SAMConfig = SAMConfig()) -> None:
-        self.cfg = cfg
-        self._predictor = None
+    def __init__(self, cfg: SAM2Config = SAM2Config()) -> None:
+        self.cfg         = cfg
+        self._predictor  = None
+        self._auto_gen   = None
+        self._device     = cfg.device or self._auto_device()
 
-        if _sam_lib is None:
-            log.warning(
-                "segment_anything not installed — SAMSegmentor in stub mode. "
-                "Install with: pip install segment-anything"
+        checkpoint = os.path.abspath(cfg.checkpoint)
+        if not os.path.exists(checkpoint):
+            raise RuntimeError(
+                f"SAM2 checkpoint not found at '{checkpoint}'.\n"
+                "Download with:\n"
+                "  from huggingface_hub import hf_hub_download\n"
+                "  hf_hub_download('facebook/sam2-hiera-tiny', "
+                "'sam2_hiera_tiny.pt', local_dir='checkpoints/sam2')"
             )
-            return
 
         try:
-            device = cfg.device or self._auto_device()
-            sam    = _sam_lib.sam_model_registry[cfg.model_type](
-                checkpoint=cfg.weights_path
+            from sam2.build_sam import build_sam2
+            from sam2.sam2_image_predictor import SAM2ImagePredictor
+            from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
+
+            model = build_sam2(cfg.config, checkpoint, device=self._device)
+            self._predictor = SAM2ImagePredictor(model)
+            self._auto_gen  = SAM2AutomaticMaskGenerator(
+                model,
+                points_per_side        = 16,
+                pred_iou_thresh        = cfg.score_thresh,
+                stability_score_thresh = cfg.score_thresh,
             )
-            sam.to(device=device)
-            self._predictor = _sam_lib.SamPredictor(sam)
-            log.info("SAMSegmentor loaded %r on %s", cfg.model_type, device)
+            log.info("SAM2Segmentor loaded on %s", self._device)
+
         except Exception as exc:
-            log.error("Failed to load SAM model: %s", exc)
-            self._predictor = None
+            raise RuntimeError(f"SAM2Segmentor failed to load: {exc}") from exc
 
-    # ── properties ────────────────────────────────────────────────────────────
-
-    @property
-    def is_loaded(self) -> bool:
-        """True if the SAM model was loaded successfully."""
-        return self._predictor is not None
-
-    # ── public API ────────────────────────────────────────────────────────────
+    # ── public API ─────────────────────────────────────────────────────────────
 
     def segment_from_bbox(
         self,
-        image: np.ndarray,
+        image:     np.ndarray,
         bbox_xyxy: np.ndarray,
     ) -> Optional[np.ndarray]:
         """
-        Segment one object given its axis-aligned bounding box.
+        Segment one object from its bounding box.
 
         Parameters
         ----------
-        image    : (H, W, 3) uint8 RGB image
-        bbox_xyxy: (4,) float32 array [x1, y1, x2, y2] in pixel coordinates
+        image     : (H, W, 3) uint8 RGB
+        bbox_xyxy : (4,) float32 [x1, y1, x2, y2]
 
         Returns
         -------
-        (H, W) bool mask, or None if SAM is unavailable or score < score_thresh.
-
-        Raises
-        ------
-        ImportError  : if segment_anything is not installed
-        RuntimeError : if the SAM weights failed to load
+        (H, W) bool mask, or None if score below threshold or inference fails.
         """
-        self._require_predictor()
-        self._predictor.set_image(image)
-        box           = bbox_xyxy.astype(np.float32)[None]   # (1, 4)
-        masks, scores, _ = self._predictor.predict(
-            point_coords     = None,
-            point_labels     = None,
-            box              = box,
-            multimask_output = True,
-        )
-        best = int(np.argmax(scores))
-        if float(scores[best]) < self.cfg.score_thresh:
-            return None
-        return masks[best].astype(bool)
+        self._validate_image(image)
+        try:
+            self._predictor.set_image(image)
+            masks, scores, _ = self._predictor.predict(
+                box              = bbox_xyxy[None].astype(np.float32),
+                multimask_output = True,
+            )
+            best = int(np.argmax(scores))
+            if float(scores[best]) < self.cfg.score_thresh:
+                return None
+            return masks[best].astype(bool)
 
-    def segment_detections(
+        except Exception as exc:
+            log.warning("SAM2 prompted segmentation failed: %s", exc)
+            return None
+
+    def segment_unknown(
         self,
         image: np.ndarray,
-        detections: list[Detection],
-    ) -> list[Detection]:
+    ) -> list[dict]:
         """
-        Run SAM on each detection's bbox and set detection.mask in-place.
+        Automatically segment all objects in frame — no prompt needed.
 
-        The image is encoded once; each detection runs a separate predict() call
-        reusing the cached embedding.  Detections where SAM's best score is below
-        score_thresh are left with mask=None.
+        Used when YOLOv8 confidence is low and unknown objects are present.
 
         Parameters
         ----------
-        image      : (H, W, 3) uint8 RGB image
-        detections : list of Detection objects (modified in-place)
+        image : (H, W, 3) uint8 RGB
 
         Returns
         -------
-        The same list, with .mask filled on successful detections.
-
-        Raises
-        ------
-        ImportError  : if segment_anything is not installed
-        RuntimeError : if the SAM weights failed to load
+        List of dicts, each with keys:
+          'mask'       : (H, W) bool
+          'score'      : float — predicted IoU quality
+          'bbox'       : [x, y, w, h] pixel coordinates
+          'area'       : int — mask area in pixels
+        Returns empty list on failure.
         """
-        self._require_predictor()
-        if not detections:
-            return detections
+        self._validate_image(image)
+        try:
+            results = self._auto_gen.generate(image)
+            return [
+                {
+                    "mask":  r["segmentation"].astype(bool),
+                    "score": float(r["predicted_iou"]),
+                    "bbox":  r["bbox"],
+                    "area":  int(r["area"]),
+                }
+                for r in results
+                if float(r["predicted_iou"]) >= self.cfg.score_thresh
+            ]
+        except Exception as exc:
+            log.warning("SAM2 automatic segmentation failed: %s", exc)
+            return []
 
-        self._predictor.set_image(image)
+    # ── internals ──────────────────────────────────────────────────────────────
 
-        for det in detections:
-            box = det.bbox_xyxy.astype(np.float32)[None]
-            try:
-                masks, scores, _ = self._predictor.predict(
-                    point_coords     = None,
-                    point_labels     = None,
-                    box              = box,
-                    multimask_output = True,
-                )
-                best = int(np.argmax(scores))
-                if float(scores[best]) >= self.cfg.score_thresh:
-                    det.mask = masks[best].astype(bool)
-            except Exception as exc:
-                log.warning("SAM failed for %r: %s", det.class_name, exc)
-
-        return detections
-
-    # ── internals ─────────────────────────────────────────────────────────────
-
-    def _require_predictor(self) -> None:
-        if self._predictor is not None:
-            return
-        if _sam_lib is None:
-            raise ImportError(
-                "segment_anything is required for SAMSegmentor. "
-                "Install with: pip install segment-anything"
+    @staticmethod
+    def _validate_image(image: np.ndarray) -> None:
+        if image.ndim != 3 or image.shape[2] != 3:
+            raise ValueError(
+                f"Expected (H, W, 3) RGB image, got shape {image.shape}"
             )
-        raise RuntimeError(
-            f"SAM model failed to load from '{self.cfg.weights_path}'. "
-            "Check that the checkpoint path exists."
-        )
 
     @staticmethod
     def _auto_device() -> str:
-        try:
-            import torch
-            if torch.cuda.is_available():
-                return "cuda"
-            if torch.backends.mps.is_available():
-                return "mps"
-        except ImportError:
-            pass
+        if torch.backends.mps.is_available():
+            return "mps"
+        if torch.cuda.is_available():
+            return "cuda"
         return "cpu"
 
+    @property
+    def is_loaded(self) -> bool:
+        return self._predictor is not None
+
     def __repr__(self) -> str:
-        status = "loaded" if self.is_loaded else "stub"
-        return f"SAMSegmentor({self.cfg.model_type!r}, {status})"
+        status = "loaded" if self.is_loaded else "failed"
+        return f"SAM2Segmentor(device='{self._device}', {status})"
