@@ -86,14 +86,20 @@ class CLIPIdentifier:
         self._device = cfg.device or self._auto_device()
 
         try:
-            self._proc  = CLIPProcessor.from_pretrained(cfg.model_id)
-            self._model = CLIPModel.from_pretrained(cfg.model_id).to(self._device)
+            self._proc  = CLIPProcessor.from_pretrained(cfg.model_id, local_files_only=True)
+            self._model = CLIPModel.from_pretrained(cfg.model_id, local_files_only=True).to(self._device)
             self._model.eval()
-            log.info("CLIPIdentifier loaded on %s", self._device)
-        except Exception as exc:
-            raise RuntimeError(
-                f"CLIPIdentifier failed to load '{cfg.model_id}': {exc}"
-            ) from exc
+            log.info("CLIPIdentifier loaded on %s (local cache)", self._device)
+        except Exception:
+            try:
+                self._proc  = CLIPProcessor.from_pretrained(cfg.model_id)
+                self._model = CLIPModel.from_pretrained(cfg.model_id).to(self._device)
+                self._model.eval()
+                log.info("CLIPIdentifier loaded on %s (downloaded)", self._device)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"CLIPIdentifier failed to load '{cfg.model_id}': {exc}"
+                ) from exc
 
     # ── public API ─────────────────────────────────────────────────────────────
 

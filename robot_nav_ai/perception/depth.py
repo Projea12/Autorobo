@@ -44,16 +44,26 @@ class DepthEstimator:
 
         try:
             self._pipe = hf_pipeline(
-                task    = "depth-estimation",
-                model   = _MODEL_ID,
-                device  = self._device,
+                task              = "depth-estimation",
+                model             = _MODEL_ID,
+                device            = self._device,
+                local_files_only  = True,
             )
-            log.info("DepthEstimator loaded on %s", self._device)
-        except Exception as exc:
-            raise RuntimeError(
-                f"DepthEstimator failed to load '{_MODEL_ID}': {exc}\n"
-                "Check internet connection for first-time model download."
-            ) from exc
+            log.info("DepthEstimator loaded on %s (local cache)", self._device)
+        except Exception:
+            # Local cache miss — allow network download on first install
+            try:
+                self._pipe = hf_pipeline(
+                    task    = "depth-estimation",
+                    model   = _MODEL_ID,
+                    device  = self._device,
+                )
+                log.info("DepthEstimator loaded on %s (downloaded)", self._device)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"DepthEstimator failed to load '{_MODEL_ID}': {exc}\n"
+                    "Check internet connection for first-time model download."
+                ) from exc
 
     # ── public API ─────────────────────────────────────────────────────────────
 
