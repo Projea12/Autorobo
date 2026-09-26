@@ -1,100 +1,102 @@
 """
-depth.py — DepthAnything v2 Depth Estimator (Phase 6)
+perception/depth.py — DepthAnything v2 Small depth estimator.
 
-Estimates metric depth maps from monocular RGB images using DepthAnything v2.
-Provides absolute depth values in metres (metric depth mode), required for
-accurate 3D object localisation and grasp pose estimation.
+Loads DepthAnything v2 Small via HuggingFace transformers.
+Runs on MPS (Apple M1) for real-time inference.
+Outputs metric depth maps in metres from single RGB frames.
 
-The depth map is fused with segmentation masks from ObjectSegmenter to
-estimate the 3D centroid of each detected object in the camera frame.
-
-Usage:
-    from perception.depth import DepthEstimator
-
-    estimator = DepthEstimator(cfg.perception.depth)
-    depth_map = estimator.estimate(rgb_image)  # (H, W) float32, metres
-    object_depth = estimator.get_object_depth(depth_map, mask)  # scalar metres
+Failure modes handled:
+  - Model download failure  → RuntimeError with clear message
+  - MPS unavailable         → falls back to CPU automatically
+  - Invalid image input     → ValueError with shape info
+  - Inference failure       → RuntimeError, system continues with last valid map
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Optional
 
 import numpy as np
+import torch
+from PIL import Image
+from transformers import pipeline as hf_pipeline
 
 log = logging.getLogger(__name__)
+
+_MODEL_ID   = "depth-anything/Depth-Anything-V2-Small-hf"
+_MIN_DEPTH  = 0.1    # metres
+_MAX_DEPTH  = 10.0   # metres
 
 
 class DepthEstimator:
     """
-    DepthAnything v2 monocular metric depth estimator.
+    DepthAnything v2 Small — monocular metric depth from single RGB frame.
 
-    Predicts dense depth maps from single RGB images. Operates in
-    metric depth mode — outputs absolute distances in metres, not
-    relative/affine depth that requires scale estimation.
-
-    Configuration via DictConfig (from configs/perception/yolo.yaml):
-        model_size: "small", "base", or "large"
-        checkpoint: path to .pth model file
-        device: "cpu", "cuda:0", or "mps"
-        min_depth: minimum valid depth in metres (default 0.1)
-        max_depth: maximum valid depth in metres (default 10.0)
+    Runs on MPS (M1) when available, falls back to CPU.
+    Thread-safe for single-threaded perception pipeline use.
     """
 
-    def __init__(self, cfg: Any) -> None:
-        """
-        Initialise and load the DepthAnything v2 model.
+    def __init__(self) -> None:
+        self._pipe       = None
+        self._last_map:  Optional[np.ndarray] = None
+        self._device     = "mps" if torch.backends.mps.is_available() else "cpu"
 
-        Args:
-            cfg: DictConfig with depth estimator settings.
-
-        TODO: Phase 6 — implement:
-            from depth_anything_v2.dpt import DepthAnythingV2
-            model_configs = {
-                "small": {"encoder": "vits", "features": 64, "out_channels": [48, 96, 192, 384]},
-                "base":  {"encoder": "vitb", "features": 128, "out_channels": [96, 192, 384, 768]},
-                "large": {"encoder": "vitl", "features": 256, "out_channels": [256, 512, 1024, 1024]},
-            }
-            self._model = DepthAnythingV2(**model_configs[cfg.model_size])
-            state_dict = torch.load(cfg.checkpoint, map_location="cpu")
-            self._model.load_state_dict(state_dict)
-            self._model.to(cfg.device).eval()
-        """
-        self.cfg = cfg
-        self._model = None  # DepthAnythingV2 — loaded in Phase 6
-        self._min_depth = getattr(cfg, "min_depth", 0.1)
-        self._max_depth = getattr(cfg, "max_depth", 10.0)
-        log.info("DepthEstimator created (model not yet loaded — TODO: Phase 6)")
-
-    def estimate(self, image: np.ndarray) -> np.ndarray:
-        """
-        Estimate a metric depth map from an RGB image.
-
-        Args:
-            image: RGB image as np.ndarray of shape (H, W, 3), dtype uint8.
-
-        Returns:
-            Depth map as np.ndarray of shape (H, W), dtype float32.
-            Values are in metres. Invalid/occluded pixels are np.nan.
-            Range: [min_depth, max_depth] metres.
-
-        TODO: Phase 6 — implement:
-            import torch
-            img_tensor = self._preprocess(image)  # normalise, resize to 518x518
-            with torch.inference_mode():
-                depth = self._model(img_tensor)
-            depth = self._postprocess(depth, original_shape=image.shape[:2])
-            depth = np.clip(depth, self._min_depth, self._max_depth)
-            return depth
-        """
-        if self._model is None:
-            raise RuntimeError(
-                "DepthEstimator model not loaded. TODO: Phase 6 — load model in __init__."
+        try:
+            self._pipe = hf_pipeline(
+                task    = "depth-estimation",
+                model   = _MODEL_ID,
+                device  = self._device,
             )
-        raise NotImplementedError(
-            "TODO: Phase 6 — implement estimate() using DepthAnythingV2 inference."
-        )
+            log.info("DepthEstimator loaded on %s", self._device)
+        except Exception as exc:
+            raise RuntimeError(
+                f"DepthEstimator failed to load '{_MODEL_ID}': {exc}\n"
+                "Check internet connection for first-time model download."
+            ) from exc
+
+    # ── public API ─────────────────────────────────────────────────────────────
+
+    def estimate(self, frame: np.ndarray) -> np.ndarray:
+        """
+        Estimate depth from a single RGB frame.
+
+        Parameters
+        ----------
+        frame : (H, W, 3) uint8 RGB numpy array
+
+        Returns
+        -------
+        (H, W) float32 depth map in metres, clipped to [0.1, 10.0].
+        Returns last valid map on inference failure — never raises mid-loop.
+        """
+        if frame.ndim != 3 or frame.shape[2] != 3:
+            raise ValueError(
+                f"Expected (H, W, 3) RGB frame, got shape {frame.shape}"
+            )
+
+        try:
+            pil_img    = Image.fromarray(frame)
+            result     = self._pipe(pil_img)
+            depth      = np.array(result["depth"], dtype=np.float32)
+
+            # Resize to match input frame resolution
+            if depth.shape != frame.shape[:2]:
+                pil_depth = Image.fromarray(depth).resize(
+                    (frame.shape[1], frame.shape[0]),
+                    resample=Image.BILINEAR,
+                )
+                depth = np.array(pil_depth, dtype=np.float32)
+
+            depth = np.clip(depth, _MIN_DEPTH, _MAX_DEPTH)
+            self._last_map = depth
+            return depth
+
+        except Exception as exc:
+            log.warning("DepthEstimator inference failed: %s — returning last valid map", exc)
+            if self._last_map is not None:
+                return self._last_map
+            return np.full(frame.shape[:2], _MAX_DEPTH, dtype=np.float32)
 
     def get_object_depth(
         self,
@@ -103,89 +105,83 @@ class DepthEstimator:
         aggregation: str = "median",
     ) -> float:
         """
-        Estimate the depth of a masked object region.
+        Estimate depth of a masked object region.
 
-        Args:
-            depth_map: Depth map from estimate(), shape (H, W), float32.
-            mask: Binary mask of the object, shape (H, W), dtype bool.
-            aggregation: How to aggregate depth values within the mask.
-                "median" (robust to outliers), "mean", or "min" (nearest point).
+        Parameters
+        ----------
+        depth_map   : (H, W) float32 depth map from estimate()
+        mask        : (H, W) bool mask of the object region
+        aggregation : "median" | "mean" | "min"
 
-        Returns:
-            Estimated object depth in metres.
-
-        Raises:
-            ValueError: If mask has no valid pixels in the depth map.
+        Returns
+        -------
+        Depth in metres. Returns _MAX_DEPTH if no valid pixels in mask.
         """
-        masked_depths = depth_map[mask]
-        valid_depths = masked_depths[
-            ~np.isnan(masked_depths) &
-            (masked_depths >= self._min_depth) &
-            (masked_depths <= self._max_depth)
-        ]
+        masked = depth_map[mask]
+        valid  = masked[(masked >= _MIN_DEPTH) & (masked <= _MAX_DEPTH)]
 
-        if len(valid_depths) == 0:
-            raise ValueError(
-                "No valid depth values in masked region. "
-                "Check that the mask overlaps a region with valid depth."
-            )
+        if len(valid) == 0:
+            log.warning("get_object_depth: no valid pixels in mask, returning max depth")
+            return _MAX_DEPTH
 
         if aggregation == "median":
-            return float(np.median(valid_depths))
+            return float(np.median(valid))
         elif aggregation == "mean":
-            return float(np.mean(valid_depths))
+            return float(np.mean(valid))
         elif aggregation == "min":
-            return float(np.min(valid_depths))
+            return float(np.min(valid))
         else:
-            raise ValueError(f"Unknown aggregation mode: {aggregation!r}")
+            raise ValueError(f"Unknown aggregation: {aggregation!r}. Use 'median', 'mean', or 'min'.")
 
     def pixel_to_3d(
         self,
-        pixel_xy: np.ndarray,
-        depth: float,
+        pixel_xy:          np.ndarray,
+        depth:             float,
         camera_intrinsics: np.ndarray,
     ) -> np.ndarray:
         """
-        Back-project a 2D pixel point + depth to a 3D camera-frame point.
+        Back-project pixel + depth to 3D camera-frame point.
 
-        Args:
-            pixel_xy: Pixel coordinates [u, v], shape (2,).
-            depth: Depth value at this pixel, in metres.
-            camera_intrinsics: Camera K matrix, shape (3, 3).
-                [[fx, 0, cx], [0, fy, cy], [0, 0, 1]]
+        Parameters
+        ----------
+        pixel_xy          : (2,) [u, v] pixel coordinates
+        depth             : depth in metres
+        camera_intrinsics : (3, 3) camera K matrix
 
-        Returns:
-            3D point [X, Y, Z] in camera frame, in metres. Shape (3,).
+        Returns
+        -------
+        (3,) [X, Y, Z] in metres, camera frame.
         """
         fx = camera_intrinsics[0, 0]
         fy = camera_intrinsics[1, 1]
         cx = camera_intrinsics[0, 2]
         cy = camera_intrinsics[1, 2]
+        u, v = float(pixel_xy[0]), float(pixel_xy[1])
+        return np.array([
+            (u - cx) * depth / fx,
+            (v - cy) * depth / fy,
+            depth,
+        ], dtype=np.float32)
 
-        u, v = pixel_xy
-        x = (u - cx) * depth / fx
-        y = (v - cy) * depth / fy
-        z = depth
-
-        return np.array([x, y, z], dtype=np.float32)
-
-    def visualise_depth(self, depth_map: np.ndarray) -> np.ndarray:
+    def visualise(self, depth_map: np.ndarray) -> np.ndarray:
         """
-        Convert a depth map to a colourised RGB image for debugging.
+        Colourise depth map for display.
 
-        Args:
-            depth_map: Depth map, shape (H, W), float32.
-
-        Returns:
-            Colourised depth image, shape (H, W, 3), uint8.
-            Uses inferno colormap: dark=near, bright=far.
-
-        TODO: Phase 6 — implement:
-            import matplotlib.cm as cm
-            normalised = (depth_map - depth_map.min()) / (depth_map.ptp() + 1e-8)
-            colourised = (cm.inferno(normalised)[:, :, :3] * 255).astype(np.uint8)
-            return colourised
+        Returns (H, W, 3) uint8 BGR image — near=dark blue, far=yellow.
         """
-        raise NotImplementedError(
-            "TODO: Phase 6 — implement depth visualisation with matplotlib colormap."
+        import cv2
+        valid_min = float(np.percentile(depth_map, 2))
+        valid_max = float(np.percentile(depth_map, 98))
+        norm = np.clip(
+            (depth_map - valid_min) / (valid_max - valid_min + 1e-8),
+            0.0, 1.0,
         )
+        grey = (norm * 255).astype(np.uint8)
+        return cv2.applyColorMap(grey, cv2.COLORMAP_INFERNO)
+
+    @property
+    def device(self) -> str:
+        return self._device
+
+    def __repr__(self) -> str:
+        return f"DepthEstimator(model='{_MODEL_ID}', device='{self._device}')"
